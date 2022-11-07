@@ -46,9 +46,10 @@ from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
 
-from Bio import AlignIO, SeqIO
+from Bio import AlignIO, SeqIO, Phylo
 from Bio.Align.Applications import ClustalwCommandline
 from Bio.Align.AlignInfo import SummaryInfo
+from Bio.Align import MultipleSeqAlignment
 from Bio.Seq import Seq
 from Bio.Data import CodonTable
 from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
@@ -828,9 +829,9 @@ def create_training_set(filepath, category, options):
     for i in range(0, len(windows)):
         w = windows[i]
         print("Calculating features:", i, "/", len(windows))
-        sci, zscore, entropy, hex_score, codon_conservation = get_feature_set(w, hexamer_model=options.hexamer_model)
+        sci, zscore, entropy, hex_score, codon_conservation = get_feature_set(w, hexamer_model=options.hexamer_model, tree_path=options.tree_path)
 
-        scis += sci 
+        scis += sci
         zs += zscore
         entropies += entropy
         hexamers += hex_score
@@ -1447,14 +1448,29 @@ def calculate_offset(seq, index):
     return index - old_index 
 
 
-def codon_conservation(alignment):
+def sanitize_alignment(aln):
+    for record in aln:
+        record.id = str(record.id).split(".")[0]
+    set_id = set()
+    aln_ = []
+    for record in aln:
+        if record.id not in set_id:
+            aln_.append(record)
+        set_id.add(record.id)
+    return MultipleSeqAlignment(records=aln_)
+
+
+def codon_conservation(alignment, tree_path=None):
     seqs = [str(record.seq) for record in alignment._records]
-    names = [str(record.id) for record in alignment._records]
-    # names = ["sequence_%s" % i for i in range(0, len(names))]
+    names = [str(record.id).split(".")[0] for record in alignment._records]
     
-    calculator = DistanceCalculator('identity')
-    constructor = DistanceTreeConstructor(calculator, 'nj')
-    tree = constructor.build_tree(alignment)
+    if tree_path:
+        tree = Phylo.read(tree_path, "newick")
+    else:
+        alignment_ = sanitize_alignment(alignment)
+        calculator = DistanceCalculator('identity')
+        constructor = DistanceTreeConstructor(calculator, 'nj')
+        tree = constructor.build_tree(alignment_)
         
     frames = [0, 1, 2]
     codon_length = 3
@@ -1556,16 +1572,30 @@ def get_genome_coordinates(filename):
     return starts, ends, strand, chrs
 
 
+def get_sequence_id(id_, id_set):
+    if id_ in id_set:
+        if len(id_.split(".")) == 1:
+            return id_.split(".")[0] + ".1"
+        count = int(id_.split(".")[1])
+        return id_.split(".")[0] + "." + str(count +1)
+    return id_
+
+
 def parse_windows(filename):
     try:
         alignments = AlignIO.parse(filename, "clustal")
         align_dict = {}
         alignment_count = 0
         for a in alignments:
+            id_set = set()
             seq_count = 0
             for record in a:
                 seq_count += 1
-                record.id = "sequence_%s" % seq_count
+                id_ = record.id.split(".")[0]
+                id_set.add(id_)
+                id_updated = get_sequence_id(id_, id_set)
+                id_set.add(id_updated)
+                record.id = id_updated
             alignment_count += 1
             align_dict[alignment_count] = a
         return align_dict
@@ -1576,15 +1606,22 @@ def parse_windows(filename):
             align_dict = {}
             alignment_count = 0
             for a in alignments:
+                id_set = set()
                 seq_count = 0
                 for record in a:
                     seq_count += 1
-                    record.id = "sequence_%s" % seq_count
+                    id_ = record.id.split(".")[0]
+                    id_set.add(id_)
+                    id_updated = get_sequence_id(id_, id_set)
+                    id_set.add(id_updated)
+                    record.id = id_updated
                 alignment_count += 1
                 align_dict[alignment_count] = a
+            print(align_dict)
             return align_dict
-        except Exception:
+        except Exception as e:
             print("Unknown alignment format found. Neither Clustal nor MAF. Aborting.")
+            raise e
 
 
 def get_reverse_complement(alignment):
@@ -1598,22 +1635,9 @@ def only_codon_conservation(window):
     for (k, a) in alignment_dict.items():
         print(a)
         print(codon_conservation(a))
+        
 
-
-def get_features_from_list(seqs):
-    scis, zs, entropies, hexamers = [], [], [], []
-    
-    seqs = [seq.replace("T", U"") for seq in seqs]
-    sci = structural_conservation_index(seqs)
-    entropies = shannon_entropy(seqs)
-    seqs = [ungap_sequence(seq) for seq in seqs]
-    z = z_score_of_mfe(seqs)
-    hexamers = hexamer_score(seqs)
-    
-    return sci, z, entropies, hexamers
-
-
-def get_feature_set(window, hexamer_model, reverse=False):
+def get_feature_set(window, hexamer_model, reverse=False, tree_path=None):
     alignment_dict = parse_windows(window)
     scis, zs, entropies, hexamers, codon_cons = [], [], [], [], []
     count = 0
@@ -1629,7 +1653,7 @@ def get_feature_set(window, hexamer_model, reverse=False):
         s = [seq.replace("T", "U") for seq in s]
         scis.append(structural_conservation_index(s))
         entropies.append(shannon_entropy(s))
-        codon_cons.append(codon_conservation(a_))
+        codon_cons.append(codon_conservation(a_, tree_path))
         seqs = [ungap_sequence(seq) for seq in s]
         zs.append(z_score_of_mfe(seqs))
         hexamers.append(hexamer_score(seqs, hexamer_model))
@@ -2174,6 +2198,7 @@ def data(parser):
     parser.add_option("-p", "--positive-label", action="store", default="ncRNA",dest="pos_label",help="The label that should be assigned to the feature vectors generated from the (non-control) input data. Can be CDS (for protein coding sequences) or ncRNA. (Default: ncRNA).")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv"),help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
     parser.add_option("-S", "--no-structural-filter", action="store", default=False,dest="structure_filter",help="Set this flag to True if no filtering of alignment windows for statistical significance of structure should occur (Default: False).")
+    parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
     options, args = parser.parse_args()
     
     has_input_options(parser, options)
@@ -2285,13 +2310,14 @@ def features(parser):
     
     parser.add_option("-R","--reverse",action="store", dest="reverse", default=False, help="Also scan the reverse complement when calculating features.")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=hexamer_backup,help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
+    parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
     
     options, args = parser.parse_args()
     has_input_options(parser, options)
     starts, ends, directions, chromosomes = get_genome_coordinates(options.in_file)
-    scis, zs, entropies, hexamers, codon_cons = get_feature_set(options.in_file, hexamer_model=options.hexamer_model)
+    scis, zs, entropies, hexamers, codon_cons = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, tree_path=options.tree_path)
     if options.reverse:
-        scis_reverse, zs_reverse, entropies_reverse, hexamers_reverse, codons_reverse = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, reverse=True)
+        scis_reverse, zs_reverse, entropies_reverse, hexamers_reverse, codons_reverse = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, reverse=True, tree_path=options.tree_path)
         df = pd.DataFrame(data={
             "SCI": flatten_me(scis, scis_reverse),
             "z-score of MFE": flatten_me(zs, zs_reverse),
