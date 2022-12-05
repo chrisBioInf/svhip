@@ -1058,6 +1058,79 @@ def combine(options):
         df.to_csv(name, sep="\t", index=False)
 
 
+
+################################################
+#
+#               Generate Hexamer Model
+#
+################################################
+
+
+def hexamer_permutations():
+    return [str().join(x) for x in product(*(["ATGC"] * 6))]
+
+
+def get_hexamers_from_seq(seq):
+    hexamers = []
+    i = 0
+    while i < len(seq)+6:
+        hexamers.append(seq[i:i+6])
+        i += 3
+    return hexamers
+
+
+def get_fasta_sequence(filename):
+    handle = SeqIO.parse(handle=open(filename, 'r'), format="fasta")
+    records = [str(record.seq) for record in handle]
+    return records
+    
+
+def hexamer_model_calibration(options):
+    coding_file = options.in_coding
+    noncoding_file = options.in_noncoding
+    outfile = options.out_file
+    
+    if not outfile.endswith(".tsv"):
+        outfile = outfile + ".tsv"
+    
+    coding_seqs = get_fasta_sequence(coding_file)
+    noncoding_seqs = get_fasta_sequence(noncoding_file)
+    hex_combinations = hexamer_permutations()
+    
+    noncoding_dict = {}
+    coding_dict = {}
+    coding_hexamers, noncoding_hexamers = [], []
+    n_seqs_coding = len(coding_seqs)
+    n_seqs_noncoding = len(noncoding_seqs)
+    count = 0
+    
+    for seq in coding_seqs:
+        count += 1
+        print("Screen coding sequences: %s/%s" % (count, n_seqs_coding))
+        coding_hexamers += get_hexamers_from_seq(seq)
+    count = 0
+    
+    for seq in noncoding_seqs:
+        count += 1
+        print("Screen noncoding sequences: %s/%s" % (count, n_seqs_noncoding))
+        noncoding_hexamers += get_hexamers_from_seq(seq)
+    
+    n_coding = len(coding_hexamers)
+    n_noncoding = len(noncoding_hexamers)
+    count = 0
+    
+    for hex_ in hex_combinations:
+        count += 1
+        print("Scan Hexamers: %s/%s" % (count, 4096))
+        coding_dict[hex_] = round(coding_hexamers.count(hex_) / n_coding, 8)
+        noncoding_dict[hex_] = round(noncoding_hexamers.count(hex_) / n_noncoding, 8)
+        
+    with open(outfile, "w") as f:
+        for hex_ in hex_combinations:
+            f.write("%s\t%s\t%s\n" % (hex_, coding_dict.get(hex_), noncoding_dict.get(hex_)))
+    print("Hexamer model written to %s." % outfile)
+
+
 ################################################
 #
 #               Feature calculation
@@ -2187,6 +2260,8 @@ def has_output_options(parser, options):
 
 
 def data(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-N", "--negative",action="store",type="string",dest="negative",help="Should a specific negative data set be supplied for data generation? If this field is EMPTY it will be auto-generated based on the data at hand (This will be the desired option for most uses).")
     parser.add_option("-d", "--max-id",action="store",type="int",dest="max_id",default=95,help="During data preprocessing, sequences above identity threshold (in percent) will be removed. Default: 95.")
     parser.add_option("-n", "--num-sequences",action="store",type="int",dest="n_seqs",default=100,help="Number of sequences input alignments will be optimized towards. Default: 100.")
@@ -2209,6 +2284,8 @@ def data(parser):
     
     
 def svhip_combine(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-p", "--prefix",action="store",type="string",dest="prefix",default="",help="Prefix for selection of files to combine. For example, if set to TEST, only valid feature vector containing files with the prefix TEST will be added.")
     options, args = parser.parse_args()
     
@@ -2221,6 +2298,8 @@ def svhip_combine(parser):
 
 def training(parser):
     # Model training specific options
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-S", "--structure",action="store",dest="structure",default=False,help="Flag determining if only secondary structure conservation features should be considered. If True, protein coding features will be included (Default: False).")
     parser.add_option("-M", "--model",action="store",type="string",dest="ml",default="SVM",help="The model type to be trained. You can choose LR (Logistic regression), SVM (Support vector machine) or RF (Random Forest). (Default: SVM)")
     parser.add_option("--optimize-hyperparameters",action="store",dest="optimize",default=True,help="Select if a parameter optimization should be performed for the ML model. Default is on.")
@@ -2251,6 +2330,8 @@ def training(parser):
 
 
 def data_3(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-a","--ncRNA",action="store",type="string", dest="ncrna",help="The input directory or file containing ncRNA training examples (Required).")
     parser.add_option("-b","--protein",action="store",type="string", dest="protein",help="The input directory or file containing protein encoding training examples (Required).")
     parser.add_option("-N", "--negative",action="store",type="string",dest="negative",help="Should a specific negative data set be supplied for data generation? If this field is EMPTY it will be auto-generated based on the data at hand (This will be the desired option for most uses).  ")
@@ -2285,6 +2366,8 @@ def data_3(parser):
 
 def evaluate(parser):
     # Test / prediction specific options
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("--model-path",action="store",type="string",dest="model_path",default="",help="If running a model test (--task test) or prediction (--task predict), this is the path of the model to evaluate. The data set to use should be handed over with -i, --input. ")
     options, args = parser.parse_args()
     has_input_options(parser, options)
@@ -2294,6 +2377,8 @@ def evaluate(parser):
 
 def predict(parser):
     # Test / prediction specific options
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-M", "--model-path",action="store",type="string",dest="model_path",default="",help="If running a model test (--task test) or prediction (--task predict), this is the path of the model to evaluate. The data set to use should be handed over with -i, --input. ")
     parser.add_option("--column-label",action="store",type="string",dest="prediction_label",default="Prediction",help="Column name for the prediction in the output.")
     parser.add_option("--structure", action="store", dest="ncrna", default=False, help="Set to True if only features for conservation of secondary structure should be used. Depends on type of model.")
@@ -2308,6 +2393,8 @@ def features(parser):
     def flatten_me(forward, reverse):
         return [x for xs in zip(forward, reverse) for x in xs]
     
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     parser.add_option("-R","--reverse",action="store", dest="reverse", default=False, help="Also scan the reverse complement when calculating features.")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=hexamer_backup,help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
     parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
@@ -2352,7 +2439,17 @@ def features(parser):
         df.to_csv(fname, sep="\t")
 
 
+def hexamer_calibrator(parser):
+    parser.add_option("-c","--coding",action="store", dest="in_coding", help="Should point towards a Fasta-file of coding transcripts (transcripts HAVE to be in-frame).")
+    parser.add_option("-n","--noncoding",action="store", dest="in_noncoding", help="Fasta-file with transcripts or sequences that are NOT coding.")
+    parser.add_option("-o","--outfile",action="store", dest="out_file", help="Name or path of the file to write. Will be a tab-delimited text file (.tsv).")
+    options, args = parser.parse_args()
+    hexamer_model_calibration(options)
+
+
 def codon_conservation_score(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     options, args = parser.parse_args()
     has_input_options(parser, options)
     only_codon_conservation(options.in_file)
@@ -2365,12 +2462,10 @@ def main():
     # Setup a command line parser, replacing the outdated "currysoup" module
     usage = "\n%prog  [options]"
     parser = OptionParser(usage,version="%prog " + __version__)
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
     t = time.time()
     
     if len(args) < 2:
-        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'data_3', 'evaluate', 'predict', 'features'.")
+        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'data_3', 'evaluate', 'predict', 'features', 'combine', 'check', 'hexcalibrate'.")
         sys.exit()
     if args[1] == "data":
         data(parser)
@@ -2390,6 +2485,8 @@ def main():
         svhip_check()
     elif args[1] == "combine":
         svhip_combine(parser)
+    elif args[1] == "hexcalibrate":
+        hexamer_calibrator(parser)
     else:
         print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'data_3', 'evaluate', 'predict', 'features'.")
         sys.exit()
