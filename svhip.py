@@ -63,7 +63,6 @@ import RNA as vienna
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 RNAz_DIR = os.path.join(THIS_DIR, "RNAz_toolkit")
 hexamer_backup = os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv")
-default_prefix = "$CONDA_PREFIX/share/Svhip"
 
 class_dict = {
     1 : "OTHER",
@@ -2161,7 +2160,7 @@ def svhip_check():
         return False
     
     
-    cmd = shlex.split("svhip data -i %s/Example/tRNA_test.fasta -o temp.tsv -w 1 -g True " % default_prefix)
+    cmd = shlex.split("svhip data -i %s/Example/tRNA_test.fasta -o temp.tsv -w 1 -g True " % THIS_DIR)
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp.tsv", sep="\t")
     shutil.rmtree("temp.tsv_report")
@@ -2197,7 +2196,7 @@ def svhip_check():
         return False
     
     
-    cmd = shlex.split("svhip features -i %s/Example/Arabidopsis_1.maf -o temp2.tsv -R True " % default_prefix)
+    cmd = shlex.split("svhip features -i %s/Example/Arabidopsis_1.maf -o temp2.tsv -R True " % THIS_DIR)
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp2.tsv", sep="\t")
     
