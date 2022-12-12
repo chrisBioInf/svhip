@@ -35,5 +35,4 @@ $ conda install -c bioconda svhip
 
 This should download and install all required files.
 
-3 Learn to use
-Do not forget to read the manual (included in this repository!).
+3  Do not forget to read the manual (included in this repository!).
