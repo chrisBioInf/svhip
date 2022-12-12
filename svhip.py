@@ -11,7 +11,7 @@ __author__ = "Christopher Klapproth"
 __institution__= "University Leipzig"
 __credits__ = []
 __license__ = "GPLv2"
-__version__="1.0.0"
+__version__="1.0.4"
 __maintainer__ = "Christopher Klapproth"
 __email__ = "christopher@bioinf.uni-leipzig.de"
 __status__ = "Development"
@@ -63,6 +63,7 @@ import RNA as vienna
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 RNAz_DIR = os.path.join(THIS_DIR, "RNAz_toolkit")
 hexamer_backup = os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv")
+default_prefix = "$CONDA_PREFIX/share/Svhip"
 
 class_dict = {
     1 : "OTHER",
@@ -2141,7 +2142,7 @@ def print_results(names, alignment_number, classes):
 
 def svhip_check():
     tmp = tempfile.TemporaryFile(mode='w+b', buffering=- 1,)
-    cmd = shlex.split("python3 svhip.py data --help")
+    cmd = shlex.split("svhip data --help")
     returncode = subprocess.call(cmd, stdout=tmp)
     
     if returncode == 0:
@@ -2160,7 +2161,7 @@ def svhip_check():
         return False
     
     
-    cmd = shlex.split("python3 svhip.py data -i Example/tRNA_test.fasta -o temp.tsv -w 1 -g True ")
+    cmd = shlex.split("svhip data -i %s/Example/tRNA_test.fasta -o temp.tsv -w 1 -g True " % default_prefix)
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp.tsv", sep="\t")
     shutil.rmtree("temp.tsv_report")
@@ -2177,7 +2178,7 @@ def svhip_check():
     # model training
     ###################################################
     
-    cmd = shlex.split("python3 svhip.py training -i temp.tsv -o tempmodel")
+    cmd = shlex.split("svhip training -i temp.tsv -o tempmodel")
     returncode = subprocess.call(cmd, stdout=tmp)
     
     if returncode == 0 and os.path.exists("tempmodel/svm_classifier.model"):
@@ -2196,7 +2197,7 @@ def svhip_check():
         return False
     
     
-    cmd = shlex.split("python3 svhip.py features -i Example/Arabidopsis_1.maf -o temp2.tsv -R True ")
+    cmd = shlex.split("svhip features -i %s/Example/Arabidopsis_1.maf -o temp2.tsv -R True " % default_prefix)
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp2.tsv", sep="\t")
     
@@ -2215,7 +2216,7 @@ def svhip_check():
             return True
         return False
     
-    cmd = shlex.split("python3 svhip.py predict -i temp2.tsv -M tempmodel/svm_classifier.model -o temp2.tsv --column-label Prediction")
+    cmd = shlex.split("svhip predict -i temp2.tsv -M tempmodel/svm_classifier.model -o temp2.tsv --column-label Prediction")
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp2.tsv", sep="\t")
     
@@ -2232,8 +2233,6 @@ def svhip_check():
     os.remove("temp.tsv")
     os.remove("temp2.tsv")
     shutil.rmtree("tempmodel")
-    os.remove("Example/tRNA_test.aln")
-    os.remove("Example/tRNA_test.dnd")
 
 
 
