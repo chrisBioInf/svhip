@@ -2488,7 +2488,7 @@ def main():
     elif args[1] == "hexcalibrate":
         hexamer_calibrator(parser)
     else:
-        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'data_3', 'evaluate', 'predict', 'features'.")
+        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'combine', 'hexcalibrate'.")
         sys.exit()
     print("Program ran for %s seconds." % round(time.time() - t, 2))
     
