@@ -11,7 +11,7 @@ __author__ = "Christopher Klapproth"
 __institution__= "University Leipzig"
 __credits__ = []
 __license__ = "GPLv2"
-__version__="1.0.4"
+__version__="1.0.6"
 __maintainer__ = "Christopher Klapproth"
 __email__ = "christopher@bioinf.uni-leipzig.de"
 __status__ = "Development"
@@ -2164,8 +2164,8 @@ def svhip_check():
     returncode = subprocess.call(cmd, stdout=tmp)
     df = pd.read_csv("temp.tsv", sep="\t")
     shutil.rmtree("temp.tsv_report")
-    shutil.rmtree("Example/tRNA_test.aln_windows")
-    shutil.rmtree("Example/tRNA_test.fasta_negative")
+    # shutil.rmtree("Example/tRNA_test.aln_windows")
+    # shutil.rmtree("Example/tRNA_test.fasta_negative")
     
     if returncode == 0 and check_tsv_output(df):
         print("TEST 2 / 5: SUCCESS")
