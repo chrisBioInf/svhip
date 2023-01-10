@@ -3,7 +3,7 @@
 THIS_DIR=$(basename $(pwd))
 cd ..
 mkdir -p $CONDA_PREFIX/share
-cp -r $THIS_DIR $CONDA_PREFIX/share/svhip
+cp -r $THIS_DIR $CONDA_PREFIX/share
 mkdir -p $CONDA_PREFIX/bin/
 echo "#!/bin/sh" > $CONDA_PREFIX/bin/svhip
 echo "SHARE_DIR=$CONDA_PREFIX/share/svhip" >> $CONDA_PREFIX/bin/svhip
