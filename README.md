@@ -1,7 +1,7 @@
 # Svhip
 Retrainable machine learning pipeline for the detection of secondary structure conservation on a genome-level.
 
-1 Introduction
+# 1 Introduction
 Svhip is a software developed in Python 3.8 for analysis of multiple genome
 alignments in MAF format for the identification of conserved functional gene
 sites. It provides options for the search for both protein coding sequences
@@ -15,7 +15,7 @@ identification of secondary structure sites of high conservation, with the core
 difference being the unchangeability of the underlying RNAz model and it’s
 lack of support for the identification of coding sequences.
 
-2 Installation
+# 2 Installation
 In terms of external requirements, Svhip will require a working perl instal-
 lation and the installation of the software ClustalW2. All needed python
 libraries are contained in the included conda environment and we suggest
@@ -35,7 +35,7 @@ $ conda install -c bioconda svhip
 
 This should download and install all required files.
 
-3 Installation in case the above does not work
+# 3 Installation in case the above does not work
 On certain systems, installation via bioconda, while generally preferred, may be impossible. 
 A likely culprit is the local version of libgcc, which is system-relevant but may
 not be compatible with the rather strict requirements of the ViennaRNA package, which is
@@ -93,7 +93,7 @@ with:
 $ svhip check
 
 
-4  Do not forget to read the manual (included in this repository!).
+# 4  Do not forget to read the manual (included in this repository!).
 
 
 
