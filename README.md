@@ -51,19 +51,24 @@ from Git.
 Like before, we start by creating the base environment that will contain Svhip:
 
 $ conda create --name svhip_env python=3.9
+
 $ conda activate svhip_env
 
 Now, we install Mamba, install specific requirements and finally get ViennaRNA:
 
 $ conda install -c conda-forge mamba
+
 $ mamba install libgcc libgcc-ng libstdcxx-ng
+
 $ mamba install -c biopython viennarna
 
 You can check if the installation was succesful by opening a python console,
 import the ViennaRNA package and predict the structure of some random RNA sequence, i.e.:
 
 $ python
+
 $ import RNA
+
 $ RNA.fold("GGAAAGGTTTGGG")
 
 Following this, we now have to install all the remaining requirements. For this, we provide 
@@ -71,7 +76,9 @@ the environment.yaml with the download. So leave the environment and update it
 with the missing packages:
 
 $ conda deactivate
+
 $ conda env update -n svhip_env --file environment.yaml
+
 $ conda activate svhip_env
 
 Now all the requirements should be in place. You can now run a manual installation of 
