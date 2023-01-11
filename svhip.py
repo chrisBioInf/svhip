@@ -83,6 +83,9 @@ dinucleotides = ["AA", "AC", "AG", "AU",
                  "UA", "UC", "UG", "UU"
                  ]
 
+svr_feature_names = ['C_to_GC', 'A_to_AU', 'AA', 'AC', 'AG', 'AU', 'CA', 'CC', 'CG',
+                     'CU', 'GA', 'GC', 'GG', 'GU', 'UA', 'UC', 'UG', 'UU', 'length']
+
 THIS_DIR = os.path.dirname(os.path.realpath(__file__))
 model_std_dict, model_mean_dict = {}, {}
 
@@ -1171,7 +1174,9 @@ def calculate_sequence_features(seq, GC_content, min_len, max_len):
     doublets = length -1
     di_features = [(seq.count(dinucleotide) / doublets) for dinucleotide in dinucleotides]
     normalized_length = normalize_seq_length(length, min_len, max_len)
-    return mono_features + di_features + [normalized_length]
+    values = mono_features + di_features + [normalized_length]
+    features_ = pd.DataFrame(data=[values], columns=svr_feature_names)
+    return features_
 
 
 ######################### Shannon entropy ##########################
@@ -1244,12 +1249,12 @@ def get_bin(GC):
 
 def predict_std(seq, GC_bin, feature_vector):
     m = model_std_dict.get(GC_bin)
-    return m.predict([feature_vector])[0]
+    return m.predict(feature_vector)[0]
 
 
 def predict_mean(seq, GC_bin, feature_vector):
     m = model_mean_dict.get(GC_bin)
-    return m.predict([feature_vector])[0]
+    return m.predict(feature_vector)[0]
 
 
 def get_distribution(mfes):
@@ -1748,11 +1753,11 @@ def unpack_features(df, structure):
     
     if structure:
         y = df["Class"].ravel()
-        x = np.asarray(df[["SCI", "z-score of MFE", "Shannon-entropy",]])
+        x = df[["SCI", "z-score of MFE", "Shannon-entropy",]]
         return x, y
     
     y = df["Class"].ravel()
-    x = np.asarray(df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]])
+    x = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]
     return x, y
 
 
@@ -2143,6 +2148,8 @@ def svhip_check():
     tmp = tempfile.TemporaryFile(mode='w+b', buffering=- 1,)
     cmd = shlex.split("svhip data --help")
     returncode = subprocess.call(cmd, stdout=tmp)
+    
+    print("Running system checks...")
     
     if returncode == 0:
         print("TEST 1 / 5: SUCCESS")
