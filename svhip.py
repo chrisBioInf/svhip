@@ -73,6 +73,10 @@ class_dict = {
     "RNA": -1,
     "CDS": 0,
     }
+strand_dict = {
+    "forward": "+",
+    "reverse": "-",
+    }
 
 rng = np.random.default_rng()
 
@@ -141,6 +145,80 @@ def filter_windows(filename, edit_distances, cutoff):
 def get_consensus_sequence(alignment):
     summary = SummaryInfo(alignment)
     return summary.gap_consensus(threshold=0.4).replace("X", "-")
+
+
+def to_gtf(df, filename):
+    seqname = []
+    source = []
+    type_ = []
+    starts = []
+    ends = []
+    score = []
+    strands = []
+    frame = []
+    descriptor = []
+    
+    def in_range(end, start1, end1):
+        if (start1 < end) and (end < end1):
+            return True
+        return False
+    
+    def find_longest_window(prediction, direction, end, df_, offset):
+        n = 0
+        new_end = end
+        while n < len(df_):
+            if in_range(end, df_["start"].iloc[n], df_["end"].iloc[n]) and (prediction == df_["Prediction"].iloc[n]) and (direction == df_["direction"].iloc[n]):
+                new_end = df_["end"].iloc[n]
+                n += offset
+            else:
+                return new_end, n
+        return new_end, n
+    
+    if "start" not in df.columns:
+        print("No gene coordinate information in file. Cannot generate gtf.")
+    if "end" not in df.columns:
+        print("No gene coordinate information in file. Cannot generate gtf.")
+        
+    offset = len(set(df["direction"]))
+    
+    count = 0
+    i, j = 0, 0
+    df.sort_values(by="start", inplace=True)
+    
+    while (i < len(df)-1) and (j < len(df)-1):
+        j = i+offset
+        prediction = df["Prediction"].iloc[i]
+        direction = df["direction"].iloc[i]
+        end = df["end"].iloc[i]
+        new_end, n = find_longest_window(prediction, direction, end, df[j:], offset)
+        
+        count += 1
+        features = "locus %s;" % count
+        
+        seqname.append(df["chromosome"].iloc[i])
+        source.append("svhip")
+        type_.append(df["Prediction"].iloc[i])
+        starts.append(df["start"].iloc[i])
+        ends.append(new_end)
+        strands.append(strand_dict.get(df["direction"].iloc[i], "+"))
+        frame.append(".")
+        score.append(".")
+        descriptor.append(features) 
+        
+        i = i+n+1
+    
+    if filename.endswith(".tsv"):
+        filename = filename.replace(".tsv", ".gtf")
+    else:
+        filename = filename + ".gtf"
+    
+    with open("%s" % filename, 'w') as f:
+        for i in range(0, len(seqname)):
+            line = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
+                seqname[i], source[i], type_[i], starts[i], ends[i], 
+                score[i], strands[i], frame[i], descriptor[i]
+                )
+            f.write(line + "\n")
 
 
 ###############################################
@@ -418,7 +496,7 @@ class DPPermutations:
                  sequence_length,
                  di_features):
         self.rng = rng
-        self.sequence = sequence
+        self.sequence = "".join([x for x in  sequence.upper() if x in nucleotides])
         self.length = sequence_length
         self.sequence_type = sequence_type
         if self.sequence_type == RNA:
@@ -739,7 +817,7 @@ def plot_feature_distribution(df, out_path):
     plt.clf()
 
     corr = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]].corr()
-    corr.to_csv(out_path +"/pearson_correlation.txt")    
+    corr.to_csv(out_path +"/pearson_correlation.txt", index=False)
     print("Pearson correlation matrix of generated features: \n")
     print(corr)
 
@@ -832,7 +910,7 @@ def create_training_set(filepath, category, options):
     for i in range(0, len(windows)):
         w = windows[i]
         print("Calculating features:", i, "/", len(windows))
-        sci, zscore, entropy, hex_score, codon_conservation = get_feature_set(w, hexamer_model=options.hexamer_model, tree_path=options.tree_path)
+        sci, zscore, entropy, hex_score, codon_conservation = get_feature_set(w, hexamer_model=options.hexamer_model, tree_path=options.tree_path, stdout=False)
 
         scis += sci
         zs += zscore
@@ -931,18 +1009,16 @@ def build_data(options, filename):
         sys.exit()
     
     print("Worktree generated:")
-    for (k, v) in worktree.items():
-        print(k, "-->", class_dict.get(v))
     vectortable = pd.concat([create_training_set(f, c, options) for (f, c) in list(worktree.items())])
-    print("Data generation process exited normally.")
-    
     vectortable["Class"] = [class_dict.get(a) for a in vectortable["Class"]]
+    
     create_report(df=vectortable, options=options)
     if options.out_file.endswith(".tsv"):
         vectortable.to_csv(options.out_file, sep="\t", index=False)
         return vectortable, options.out_file
         
     vectortable.to_csv(options.out_file+"_trainingdata.tsv", sep="\t", index=False)
+    print("Data generation process exited normally.")
     return vectortable, options.out_file+"_trainingdata.tsv"
 
 
@@ -1014,10 +1090,10 @@ def build_three_way_data(options):
     vectortable = pd.concat([create_training_set(f, c, options) for (f, c) in list(worktree.items())])
     print("Data generation process exited normally.")
     
-    vectortable.to_csv(options.out_file+"_trainingdata.csv", sep="\t")
-    create_report(df=pd.read_csv(options.out_file+"_trainingdata.csv", sep="\t"), options=options)
+    vectortable.to_csv(options.out_file+"_trainingdata.tsv", sep="\t", index=False)
+    create_report(df=pd.read_csv(options.out_file+"_trainingdata.tsv", sep="\t"), options=options)
     
-    return vectortable, options.out_file+"_trainingdata.csv"
+    return vectortable, options.out_file+"_trainingdata.tsv"
 
 
 
@@ -1633,21 +1709,22 @@ def codon_conservation(alignment, tree_path=None):
 def get_genome_coordinates(filename):
     try:
         alignments = AlignIO.parse(filename, "maf")
+        starts = []
+        ends = []
+        strand = []
+        chrs = []
+        
+        for align in alignments:
+            reference = align[0]
+            starts.append(reference.annotations["start"])
+            ends.append(reference.annotations["start"] + reference.annotations["size"])
+            strand.append(reference.annotations["strand"])
+            chrs.append(reference.id.split(".")[1])
+            
+        return starts, ends, strand, chrs
+
     except Exception:
         return [], [], [], []
-    starts = []
-    ends = []
-    strand = []
-    chrs = []
-    
-    for align in alignments:
-        reference = align[0]
-        starts.append(reference.annotations["start"])
-        ends.append(reference.annotations["start"] + reference.annotations["size"])
-        strand.append(reference.annotations["strand"])
-        chrs.append(reference.id.split(".")[1])
-        
-    return starts, ends, strand, chrs
 
 
 def get_sequence_id(id_, id_set):
@@ -1695,7 +1772,6 @@ def parse_windows(filename):
                     record.id = id_updated
                 alignment_count += 1
                 align_dict[alignment_count] = a
-            print(align_dict)
             return align_dict
         except Exception as e:
             print("Unknown alignment format found. Neither Clustal nor MAF. Aborting.")
@@ -1715,26 +1791,49 @@ def only_codon_conservation(window):
         print(codon_conservation(a))
         
 
-def get_feature_set(window, hexamer_model, reverse=False, tree_path=None):
+def get_feature_set(window, hexamer_model, reverse=False, tree_path=None, stdout=True, starts=[0], ends=[0], sequences=[0]):
     alignment_dict = parse_windows(window)
     scis, zs, entropies, hexamers, codon_cons = [], [], [], [], []
-    count = 0
-    length = len(alignment_dict)
+    count = -1
+    
+    def print_output_row(sci, z, entropy, hexamer, conservation, start=0, end=0, direction="forward", sequence=""):
+        if start != 0 and end !=0:
+            print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (sci, z, entropy, hexamer, conservation, start, end, direction, sequence))
+        else:
+            print("%s\t%s\t%s\t%s\t%s\t%s" % (sci, z, entropy, hexamer, conservation, direction, ))
     
     for (k, a) in alignment_dict.items():
-        a_ = a
-        if reverse:
-            a_ = get_reverse_complement(a)
         count += 1
-        print(count, "/", length)
-        s = [str(record.seq) for record in a_._records]
-        s = [seq.replace("T", "U") for seq in s]
-        scis.append(structural_conservation_index(s))
-        entropies.append(shannon_entropy(s))
-        codon_cons.append(codon_conservation(a_, tree_path))
-        seqs = [ungap_sequence(seq) for seq in s]
-        zs.append(z_score_of_mfe(seqs))
-        hexamers.append(hexamer_score(seqs, hexamer_model))
+        scis.append(0)
+        entropies.append(0)
+        codon_cons.append(0)
+        zs.append(0)
+        hexamers.append(0)
+        
+        if reverse:
+            direction = "reverse"
+        else:
+            direction = "forward"
+        
+        try:
+            a_ = a
+            if reverse:
+                a_ = get_reverse_complement(a)
+            s = [str(record.seq) for record in a_._records]
+            s = [seq.replace("T", "U") for seq in s]
+            scis[-1] = structural_conservation_index(s)
+            entropies[-1] = shannon_entropy(s)
+            codon_cons[-1] = codon_conservation(a_, tree_path)
+            seqs = [ungap_sequence(seq) for seq in s]
+            zs[-1] = z_score_of_mfe(seqs) 
+            hexamers[-1] = hexamer_score(seqs, hexamer_model)
+            
+            if stdout:
+                print_output_row(scis[-1], zs[-1], entropies[-1], hexamers[-1], codon_cons[-1], starts[count], ends[count], direction, sequences[count])
+        
+        except Exception as e:
+            # print(str(e))
+            continue
     
     return scis, zs, entropies, hexamers, codon_cons
 
@@ -2038,7 +2137,7 @@ def test_model(options):
     
     df["Assigned class label"] = [class_dict.get(a) for a in y_pred]
     df["True class label"] = [class_dict.get(a) for a in y_real]
-    df.to_csv("%s/class_labels.csv" % out_folder, sep="\t")
+    df.to_csv("%s/class_labels.tsv" % out_folder, sep="\t", index=False)
 
 
 def predict_with_sklearn_model(x, y, modelpath):
@@ -2123,6 +2222,9 @@ def svhip_prediction(options):
     if options.out_file:
         filename = options.out_file
     df.to_csv(filename, sep="\t", index=False)
+    
+    if bool(options.gtf) == True:
+        to_gtf(df, filename)
             
 
 def print_results(names, alignment_number, classes):
@@ -2387,6 +2489,7 @@ def predict(parser):
     parser.add_option("-M", "--model-path",action="store",type="string",dest="model_path",default="",help="If running a model test (--task test) or prediction (--task predict), this is the path of the model to evaluate. The data set to use should be handed over with -i, --input. ")
     parser.add_option("--column-label",action="store",type="string",dest="prediction_label",default="Prediction",help="Column name for the prediction in the output.")
     parser.add_option("--structure", action="store", dest="ncrna", default=False, help="Set to True if only features for conservation of secondary structure should be used. Depends on type of model.")
+    parser.add_option("--gtf", action="store", dest="gtf", default=False, help="Set to True if you want overlapping annotations to be merged and written as GTF file. IMPORTANT: Requires genomic coordinates in input.")
     options, args = parser.parse_args()
     has_input_options(parser, options)
     
@@ -2399,17 +2502,24 @@ def features(parser):
         return [x for xs in zip(forward, reverse) for x in xs]
     
     parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output file. Optional here, as features can also be printed to stdout.")
     parser.add_option("-R","--reverse",action="store", dest="reverse", default=False, help="Also scan the reverse complement when calculating features.")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=hexamer_backup,help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
     parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
+    parser.add_option("--stdout", action="store", default=True, dest="stdout", help="Set the --stdout flag to False if you do not want to have output printed to screen as well. This feature is mostly for manual redirection to files.")
     
     options, args = parser.parse_args()
     has_input_options(parser, options)
     starts, ends, directions, chromosomes = get_genome_coordinates(options.in_file)
-    scis, zs, entropies, hexamers, codon_cons = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, tree_path=options.tree_path)
+    
+    if len(starts) > 0 and len(ends) > 0 and options.stdout==True:
+        print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "start", "end", "direction", "sequence"))
+    else:
+        print("%s\t%s\t%s\t%s\t%s\t%s" % ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "direction"))
+    
+    scis, zs, entropies, hexamers, codon_cons = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, tree_path=options.tree_path, stdout=options.stdout, starts=starts, ends=ends, sequences=chromosomes)
     if options.reverse:
-        scis_reverse, zs_reverse, entropies_reverse, hexamers_reverse, codons_reverse = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, reverse=True, tree_path=options.tree_path)
+        scis_reverse, zs_reverse, entropies_reverse, hexamers_reverse, codons_reverse = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, reverse=True, tree_path=options.tree_path, stdout=options.stdout, starts=starts, ends=ends, sequences=chromosomes)
         df = pd.DataFrame(data={
             "SCI": flatten_me(scis, scis_reverse),
             "z-score of MFE": flatten_me(zs, zs_reverse),
@@ -2418,10 +2528,14 @@ def features(parser):
             "Codon conservation": flatten_me(codon_cons, codons_reverse),
             })
         if len(starts)*2 == len(df):
-            df["start"] = flatten_me(starts, starts)
-            df["end"] = flatten_me(ends, ends)
-            df["direction"] = flatten_me(["forward"]*len(scis), ["reverse"]*len(scis))
-            df["chromosome"] = flatten_me(chromosomes, chromosomes)
+            try:
+                df["start"] = flatten_me(starts, starts)
+                df["end"] = flatten_me(ends, ends)
+                df["direction"] = flatten_me(["forward"]*len(scis), ["reverse"]*len(scis))
+                df["chromosome"] = flatten_me(chromosomes, chromosomes)
+            except Exception as e:
+                print(str(e))
+                pass
         
     else:
         df = pd.DataFrame(data={
@@ -2435,13 +2549,14 @@ def features(parser):
             df["start"] = starts
             df["end"] = ends
             df["direction"] = ["forward"]*len(df)
-            df["chromosome"] = chromosomes
-    print(df)
+            df["sequence"] = chromosomes
     if options.out_file:
         fname = options.out_file
         if not fname.endswith(".tsv"):
             fname = fname + ".tsv"
-        df.to_csv(fname, sep="\t")
+        df.to_csv(fname, sep="\t", index=False)
+    else:
+        df.to_csv(options.in_file + ".svhip.tsv", sep="\t", index=False)
 
 
 def hexamer_calibrator(parser):
@@ -2459,6 +2574,13 @@ def codon_conservation_score(parser):
     has_input_options(parser, options)
     only_codon_conservation(options.in_file)
     
+    
+def create_gtf_from_prediction(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    options, args = parser.parse_args()
+    has_input_options(parser, options)
+    df = pd.read_csv(options.in_file, sep="\t")
+    to_gtf(df, options.in_file)
 
 
 def main():
@@ -2492,10 +2614,12 @@ def main():
         svhip_combine(parser)
     elif args[1] == "hexcalibrate":
         hexamer_calibrator(parser)
+    elif args[1] == "index":
+        create_gtf_from_prediction(parser)
     else:
-        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'codon_conservation', 'combine', 'hexcalibrate'.")
+        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'codon_conservation', 'combine', 'hexcalibrate', 'index'.")
         sys.exit()
-    print("Program ran for %s seconds." % round(time.time() - t, 2))
+    # print("Program ran for %s seconds." % round(time.time() - t, 2))
     
 
 if __name__=='__main__':
