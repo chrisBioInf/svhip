@@ -82,7 +82,7 @@ $ conda deactivate
 
 $ conda env update -n svhip_env --file environment.yaml
 
-$ conda activate svhip_env
+$ conda activate svhip_env```
 
 
 Now all the requirements should be in place. You can now run a manual installation of 
