@@ -1,24 +1,24 @@
 # Svhip
-Retrainable machine learning pipeline for the detection of secondary structure conservation on a genome-level.
+Retrainable machine learning pipeline for the detection of secondary structure conservation on a genome level.
 
 # 1 Introduction
 Svhip is a software developed in Python 3.8 for analysis of multiple genome
 alignments in MAF format for the identification of conserved functional gene
 sites. It provides options for the search for both protein coding sequences
-(CDS) as well as the identification of evolutionary conserved secondary struc-
-tures, hinting at functional non-coding sequences. A core feature of Svhip is
+(CDS) as well as the identification of evolutionary conserved secondary structures, hinting at functional 
+noncoding sequences. A core feature of Svhip is
 the possibility to freely retrain the classifier to account for different genomic
 contexts, usually done by providing preselected training examples in the form
-of ClustalW-alignments. Some of it’s features directly build on the RNAz
+of ClustalW alignments. Some of its features directly build on the RNAz
 framework (https://www.tbi.univie.ac.at/software/RNAz/#download) for the
 identification of secondary structure sites of high conservation, with the core
-difference being the unchangeability of the underlying RNAz model and it’s
+difference being the unchangeability of the underlying RNAz model and its
 lack of support for the identification of coding sequences.
 
 # 2 Installation
-In terms of external requirements, Svhip will require a working perl instal-
-lation and the installation of the software ClustalW2. All needed python
-libraries are contained in the included conda environment and we suggest
+In terms of external requirements, Svhip will require a working perl 
+installation and the installation of the software ClustalW2. All needed python
+libraries are contained in the included conda environment and we suggestsome of its features
 using it for the installation of these dependencies. We suggest installation
 using conda and a new environment:
 
@@ -70,6 +70,8 @@ $ python
 $ import RNA
 
 $ RNA.fold("GGAAAGGTTTGGG")
+
+If this does not produce any errors, ViennaRNA bindings should be ready to use.
 
 Following this, we now have to install all the remaining requirements. For this, we provide 
 the environment.yaml with the download. So leave the environment and update it 
