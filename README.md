@@ -77,11 +77,13 @@ Following this, we now have to install all the remaining requirements. For this,
 the environment.yaml with the download. So leave the environment and update it 
 with the missing packages:
 
+```
 $ conda deactivate
 
 $ conda env update -n svhip_env --file environment.yaml
 
 $ conda activate svhip_env
+
 
 Now all the requirements should be in place. You can now run a manual installation of 
 Svhip for this environment by simply executing 
@@ -95,7 +97,8 @@ with:
 $ svhip check
 
 
-# 4  Do not forget to read the manual (included in this repository!).
+# 4 Manual
+Do not forget to read the manual (included in this repository!).
 
 
 
