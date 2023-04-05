@@ -183,6 +183,11 @@ def to_gtf(df, filename):
     
     count = 0
     i, j = 0, 0
+    
+    if "OTHER" not in df["Prediction"]:
+        df["Prediction"] = [class_dict.get(x, "OTHER") for x in df["Prediction"]]
+    
+    df = df[df["Prediction"] != "OTHER"]
     df.sort_values(by="start", inplace=True)
     
     while (i < len(df)-1) and (j < len(df)-1):
@@ -219,6 +224,301 @@ def to_gtf(df, filename):
                 score[i], strands[i], frame[i], descriptor[i]
                 )
             f.write(line + "\n")
+
+
+###############################################
+#
+#               Merging of MAF alignment blocks
+#
+###############################################
+
+
+def print_alignment_simple(records):
+    for i in range(0, len(records)):
+        print(records[i].id)
+        print(str(records[i].seq))
+
+
+def plot_merge_summary(outfile, block_length_threshold, records, merged_records, merged_blocks_n):
+    lengths = []
+    blocks = []
+    seq_ns = []
+    
+    for record in records:
+        lengths.append(len(record[0].seq))
+        blocks.append("Pre-Merge")
+        seq_ns.append(len(record))
+    for record in merged_records:
+        lengths.append(len(record[0].seq))
+        seq_ns.append(len(record))
+        blocks.append("Post-Merge")
+    
+    data= {
+        "Length": lengths,
+        "Merge status": blocks,
+        "Number of species": seq_ns,
+        "Merged blocks": merged_blocks_n,
+        }
+    fig, ax = plt.subplots(2, 2, figsize=(9, 8))
+    sns.countplot(data=data, x="Merge status", edgecolor='k', ax=ax[0][0], width=0.5)
+    ax[0][0].set_ylabel("Count")
+    sns.boxplot(data=data, x="Merge status", y="Length", ax=ax[0][1])
+    ax[0][1].set_ylabel("Length [nt]")
+    ax[0][1].plot([-1, 2], [block_length_threshold, block_length_threshold], 'k--')
+    ax[0][1].set_yscale("log")
+    sns.boxplot(data=data, x="Merge status", y="Number of species", ax=ax[1][0], width=0.5)
+    ax[1][0].set_ylabel("Number of Species")
+    sns.histplot(data=data, x="Merged blocks", stat='probability', ax=ax[1][1])
+    ax[1][1].set_ylabel("Probability")
+    plt.savefig("%s_merge.pdf" % outfile, dpi=300, bbox_inches="tight")
+    plt.savefig("%s_merge.svg" % outfile, dpi=300, bbox_inches="tight")
+
+
+def print_similarity_matrix(matrix, records):
+    record_labels = [str(record.id) for record in records]
+    similarity_columns = {}
+    
+    for i in range(0, len(record_labels)):
+        similarity_columns[record_labels[i]] = matrix[i]
+    
+    df = pd.DataFrame(data=similarity_columns, index=similarity_columns).round(4)
+    start, end = records[i].annotations["start"], records[i].annotations["start"] + records[i].annotations["size"]
+    df.to_csv("Similarity_matrices/dmel_%s_%s.tsv" % (start, end), sep="\t")
+    return df
+    
+
+def load_alignment_file(filename):
+    try:
+        handle = AlignIO.parse(handle=open(filename, 'r'), format="maf")
+        alignments = [align for align in handle]
+        return alignments
+    except Exception:
+        print("Failed to load alignment. Is this a MAF file?")
+        sys.exit()
+
+
+def write_alignments(alignments, filename):
+    AlignIO.write([MultipleSeqAlignment(records=records) for records in alignments], 
+                  handle=open(filename, 'w'), 
+                  format="maf")
+
+
+def coordinate_distance(end1, start2):
+    return start2 - end1
+
+
+def pairwise_sequence_identity(seq1, seq2):
+    count = 0
+    for i in range(0, len(seq1)):
+        if seq1[i] == seq2[i]:
+            count += 1
+    return count / len(seq1)
+    
+
+def local_species_consensus(block1, block2):
+    block1_ids = set([str(seq.id) for seq in block1])
+    block2_ids = set([str(seq.id) for seq in block2])
+    consensus_score  = (len(block1_ids.intersection(block2_ids)) + len(block2_ids.intersection(block1_ids))) / (len(block1_ids) + len(block2_ids))
+    return consensus_score
+
+
+def concat_with_bridge(seq1, seq2, offset):
+    seq_ = Seq(str(seq1) + "N"*offset + str(seq2)) 
+    return seq_
+
+
+def fill_bridges_with_gaps(records):
+    length_dict = {}
+    seq_dict = {}
+    for i in range(0, len(records)):
+        length_dict[str(records[i].id)] = len(records[i].seq)
+        seq_dict[str(records[i].id)] = str(records[i].seq)
+    longest_seq_key = max(length_dict, key=length_dict.get)
+    longest_seq = seq_dict.get(longest_seq_key)
+    max_length = length_dict.get(longest_seq)
+    
+    for i in range(0, len(records)):
+        if len(records[i].seq) == max_length:
+            continue
+        seq = str(records[i].seq)
+        seq_ = ""
+        j = 0
+        
+        for n in range(0, len(longest_seq)):
+            if longest_seq[n] != "N":
+                seq_ = seq_ + seq[j]
+                j += 1
+            else:
+                seq_ = seq_ + "-"
+        records[i].seq = Seq(seq_)
+    
+    return records
+
+
+def eliminate_consensus_gaps(records):
+    ungapped_seqs = []
+    for i in range(0, len(records)):
+        seq = str(records[i].seq)
+        seq_ = ""
+        for c in range(0, len(seq)):
+            if seq[c] != "-":
+                seq_ = seq_ + seq[c]
+                continue
+            for j in range(0, len(records)):
+                seq_2 = str(records[j].seq)
+                if seq_2[c] != "-":
+                    seq_ = seq_ + seq[c]
+                    break
+        ungapped_seqs.append(seq_)
+    
+    for i in range(0, len(records)):
+        records[i].seq = Seq(ungapped_seqs[i])
+    
+    return records
+    
+
+def filter_by_pairwise_id(records):
+    seqs = [str(record.seq) for record in records]
+    ids = [str(record.id) for record in records]
+    matrix = np.ones(shape=(len(records), len(records)))
+    
+    for i in range(0, len(records)-1):
+        record_ = records[i]
+        seq = str(record_.seq)
+        id_ = str(record_.id)
+        for j in range(i+1, len(records)):
+            seq_ = str(records[j].seq)
+            pairwise_id = pairwise_sequence_identity(seq, seq_)
+            matrix[i][j] = pairwise_id
+            matrix[j][i] = pairwise_id
+            
+    return matrix
+
+
+def filter_by_seq_length(records):
+    length_dict = {str(record.id) : len(record.seq.replace('-', '')) for record in records}
+    record_dict = {str(record.id) : record for record in records}
+    mu = np.mean([x for x in length_dict.values()])
+    std = np.std([x for x in length_dict.values()])
+    
+    for record in records[1:]:
+        x = str(record.id)
+        if std > 0:
+            z = abs(length_dict.get(x) - mu) / std
+        else:
+            z = 0
+        if z > 2:
+            record_dict.pop(x)
+    
+    return [record for record in record_dict.values()]
+
+
+def merge_blocks(block1, block2, offset_threshold):
+    block1_ids = [str(record.id) for record in block1]
+    block2_ids = [str(record.id) for record in block2]
+    
+    if len(block1_ids) >= len(block2_ids):
+        consensus_blocks = set(block1_ids).intersection(block2_ids)
+    else:
+        consensus_blocks = set(block2_ids).intersection(block1_ids)
+    
+    block1_records = [record for record in block1 if record.id in consensus_blocks]
+    block2_records = [record for record in block2 if record.id in consensus_blocks]
+    merged_records = []
+    
+    for i in range(0, len(block1_records)):
+        record_, record2 = block1_records[i], block2_records[i]
+        strand1, strand2 = record_.annotations["strand"], record2.annotations["strand"]
+        start1, end1 = record_.annotations["start"], record_.annotations["start"] + record_.annotations["size"]
+        start2, end2 = record2.annotations["start"], record2.annotations["start"] + record2.annotations["size"]
+        offset = coordinate_distance(end1, start2)
+        if (offset > offset_threshold) or (strand1 != strand2):
+            continue
+        record_.seq = concat_with_bridge(record_.seq, record2.seq, offset)
+        record_.annotations["size"] = (end1 - start1) + offset + (end2 - start2)
+        merged_records.append(record_)
+    merged_records = fill_bridges_with_gaps(merged_records)
+    matrix = filter_by_pairwise_id(merged_records)
+    # df = print_similarity_matrix(matrix, merged_records)
+    record_dict = {str(record.id) : record for record in merged_records}
+    
+    return merged_records
+
+
+def check_block_viability(block1, block2, block_length_threshold, species_consensus_threshold, block_distance_threshold, ):
+    merge_flag = True
+    reference1 = block1[0]
+    reference2 = block2[0]
+    start1, end1 = reference1.annotations["start"], reference1.annotations["start"] + reference1.annotations["size"]
+    start2, end2 = reference2.annotations["start"], reference2.annotations["start"] + reference2.annotations["size"]
+    
+    if coordinate_distance(end1, start2) > block_distance_threshold:
+        # print("Coordinate distance")
+        merge_flag = False
+    elif reference1.annotations["strand"] != reference2.annotations["strand"]:
+        # print("Wrong strand")
+        merge_flag = False
+    elif (len(reference1.seq) > block_length_threshold) or (len(reference2.seq) > block_length_threshold):
+        # print("Already too long")
+        merge_flag = False
+    elif local_species_consensus(block1, block2) < species_consensus_threshold:
+        # print("No species consensus")
+        merge_flag = False
+    elif reference1.id != reference2.id:
+        merge_flag = False
+         
+    return merge_flag
+
+
+def merge_maf_blocks(options):
+    block_length_threshold = options.block_length
+    species_consensus_threshold = options.consensus_threshold
+    block_distance_threshold = options.distance_threshold
+    
+    alignments = load_alignment_file(options.in_file)
+    merged_alignments = []
+    i = 0
+    block1 = alignments[0]
+    merged_blocks_n = []
+    local_merges = 1
+    
+    length = len(alignments)
+    
+    while i < length-1:
+        print("Scan MAF block: %s / %s" % (i+1, length))
+        block2 = alignments[i+1]
+        merge_flag = check_block_viability(block1, block2, 
+                                           block_length_threshold,
+                                           species_consensus_threshold,
+                                           block_distance_threshold, 
+                                           )
+        
+        if merge_flag == True: 
+            block1 = merge_blocks(block1, block2, block_distance_threshold)
+            local_merges += 1
+            i += 1
+        else:
+            records = filter_by_seq_length(block1)
+            records = eliminate_consensus_gaps(records)
+            merged_alignments.append(records)
+            merged_blocks_n.append(local_merges)
+            i += 1
+            local_merges = 1
+            block1 = alignments[i]
+            
+    if merge_flag == False:
+        merged_alignments.append(eliminate_consensus_gaps(filter_by_seq_length(alignments[-1])))
+            
+    if options.out_file.endswith(".maf"):
+        outfile = options.out_file
+    else:
+        outfile = options.out_file + ".maf"
+    
+    plot_merge_summary(options.in_file, block_length_threshold,
+                       alignments, 
+                       merged_alignments, merged_blocks_n,
+                       )
+    write_alignments(merged_alignments, outfile)
 
 
 ###############################################
@@ -2207,13 +2507,24 @@ def svhip_prediction(options):
     model = load_target_model(options.model_path)
     df = pd.read_csv(options.in_file, sep="\t")
     
+    def get_prediction(prob):
+        if prob[1] > 0.5:
+            return "RNA"
+        else:
+            return "OTHER"
+    
     if options.ncrna:
         target = df[["SCI", "z-score of MFE", "Shannon-entropy"]]
     else:
         target = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]
     
-    y = model.predict(target)
-    y = [class_dict.get(y_) for y_ in y]
+    if options.probability:
+        y_prob = model.predict_proba(target)
+        y = [get_prediction(x) for x in y_prob]
+        df["Probability"] = [x[1] for x in y_prob]
+    else:
+        y = model.predict(target)
+        y = [class_dict.get(y_) for y_ in y]
     predict_column = "Prediction"
     if options.prediction_label:
         predict_column = options.prediction_label
@@ -2490,6 +2801,7 @@ def predict(parser):
     parser.add_option("--column-label",action="store",type="string",dest="prediction_label",default="Prediction",help="Column name for the prediction in the output.")
     parser.add_option("--structure", action="store", dest="ncrna", default=False, help="Set to True if only features for conservation of secondary structure should be used. Depends on type of model.")
     parser.add_option("--gtf", action="store", dest="gtf", default=False, help="Set to True if you want overlapping annotations to be merged and written as GTF file. IMPORTANT: Requires genomic coordinates in input.")
+    parser.add_option("--probability", action="store", dest="probability", default=False, help="Set to True if you want class probabilities assigned in final output. Warning: Requires model to be trained with probability flag.")
     options, args = parser.parse_args()
     has_input_options(parser, options)
     
@@ -2581,6 +2893,18 @@ def create_gtf_from_prediction(parser):
     has_input_options(parser, options)
     df = pd.read_csv(options.in_file, sep="\t")
     to_gtf(df, options.in_file)
+    
+    
+def mafmerge(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
+    parser.add_option("-l","--length",action="store",type="int", dest="block_length", default=1000,help="Maximum length that resulting MAF alignment blocks will be merged into (Default: 1000 nt).")
+    parser.add_option("-c","--consensus",action="store",type="float", dest="consensus_threshold", default=0.75,help="Defines the fraction up to which aligned species in two neighboring alignment blocks have to be identical for merging (Default: 0.75).")
+    parser.add_option("-d","--distance",action="store",type="int", dest="distance_threshold", default=0,help="Highest allowed distance between genomic coordinates of aligned sequences in neighboring alignment blocks. Species that are further apart, for exaple through genetic inserts, will be removed from merged blocks (Default: 0 nt).")
+    options, args = parser.parse_args()
+    has_input_options(parser, options)
+    has_output_options(parser, options)
+    merge_maf_blocks(options)
 
 
 def main():
@@ -2616,6 +2940,8 @@ def main():
         hexamer_calibrator(parser)
     elif args[1] == "index":
         create_gtf_from_prediction(parser)
+    elif args[1] == "mafmerge":
+        mafmerge(parser)
     else:
         print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'codon_conservation', 'combine', 'hexcalibrate', 'index'.")
         sys.exit()
