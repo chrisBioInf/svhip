@@ -1,108 +1,153 @@
-# Svhip
-Retrainable machine learning pipeline for the detection of secondary structure conservation on a genome level.
 
-# 1 Introduction
-Svhip is a software developed in Python 3.8 for analysis of multiple genome
-alignments in MAF format for the identification of conserved functional gene
-sites. It provides options for the search for both protein coding sequences
-(CDS) as well as the identification of evolutionary conserved secondary structures, hinting at functional 
-noncoding sequences. A core feature of Svhip is
-the possibility to freely retrain the classifier to account for different genomic
-contexts, usually done by providing preselected training examples in the form
-of ClustalW alignments. Some of its features directly build on the RNAz
-framework (https://www.tbi.univie.ac.at/software/RNAz/#download) for the
-identification of secondary structure sites of high conservation, with the core
-difference being the unchangeability of the underlying RNAz model and its
-lack of support for the identification of coding sequences.
+# SVHIP
 
-# 2 Installation
-In terms of external requirements, Svhip will require a working perl 
-installation and the installation of the software ClustalW2. All needed python
-libraries are contained in the included conda environment and we suggestsome of its features
-using it for the installation of these dependencies. We suggest installation
-using conda and a new environment:
-```
-$ conda create --name svhip_env python=3.9
-```
-which will generate a new conda environment using python version 3.9.
-Switch to the new environment:
-```
-$ conda activate svhip_env
-```
-Then we install Svhip from the bioconda channel using:
-```
-$ conda install -c bioconda svhip
-```
-This should download and install all required files.
+This repository contains `svhip.py`, a script for predicting functional RNA elements from multiple sequence alignments. It supports generating training data, training machine learning models, slicing alignments into windows, and predicting classes (coding, non-coding, other) for alignment windows.
 
-# 3 Installation in case the above does not work
-On certain systems, installation via bioconda, while generally preferred, may be impossible. 
-A likely culprit is the local version of libgcc, which is system-relevant but may
-not be compatible with the rather strict requirements of the ViennaRNA package, which is
-in turn required to run Svhip. You can read more about the issue in the following link,
-under the section "Troubleshooting": https://pypi.org/project/ViennaRNA/.
+Usage
+- python svhip.py [Task] [Options]
+- Tasks: data, train, windows, predict, hexcalibrate
 
-For this specific case, we provide a workaround via manual installation, which will
-(hopefully) no longer be necessary in future versions. It uses the Mamba to 
-provide the required libgcc version within an enclosed conda environment. 
+Global options (available for all tasks)
+- --threads (int, default: max(CPU_COUNT-1, 1)): Number of threads to allocate.
+- --seed (int, default: random integer at startup): Seed controlling randomized behavior (e.g. shuffling).
 
-Before we begin, move your working directory into the /svhip folder as downloaded 
-from Git.
-Like before, we start by creating the base environment that will contain Svhip:
-```
-$ conda create --name svhip_env python=3.9
+Task overview:
+- data → Generation of training data from multiple sequence alignments.
+- train → Train a prediction model on data generated with 'data' command.
+- windows → Cut an alignment into overlapping windows in preparation for alignments.
+- predict → Run a model prediction on windows generated with 'windows' program.
+- hexcalibrate → Train a hexamer frequency model which can be used for coding potential assessment.
 
-$ conda activate svhip_env
-```
-Now, we install Mamba, install specific requirements and finally get ViennaRNA:
-```
-$ conda install -c conda-forge mamba
+## svhip data
 
-$ mamba install libgcc libgcc-ng libstdcxx-ng
+### Purpose
+- Generate training data from coding and/or noncoding input sequences.
+- Align sequences (requires Clustal Omega), optionally generate a negative set (SISSIz if available, otherwise column shuffling), slice alignments into windows, and compute features into a TSV.
 
-$ mamba install -c biopython viennarna
-```
-You can check if the installation was succesful by opening a python console,
-import the ViennaRNA package and predict the structure of some random RNA sequence, i.e.:
+### Behavior
+- Requires at least one of --noncoding or --coding.
+- Checks for clustalo availability; checks SISSIz availability unless --shuffle-control is given.
+- Seeds RNG with --seed.
 
-```
-$ python
+### Options
+- --noncoding (string): Input directory with FASTA file(s) of noncoding sequences (Requires at least 1 of 'noncoding', 'coding').
+- --coding (string): Input directory with FASTA file(s) of coding sequences (Requires at least 1 of 'noncoding', 'coding').
+- --other (string): Input directory with FASTA file(s) of random (intergenic) sequences (will be auto-generated via randomization if not supplied).
+- -o, --outfile (string): Name for the output file (Required).
+- -N, --negative (string): Path to a specific negative dataset; if empty, a negative set is auto-generated.
+- -d, --max-id (float, default: 0.95): Remove sequences above this identity threshold during preprocessing (interpreted as proportion; help text mentions percent).
+- -n, --num-sequences (int, default: 100): Number of sequences input alignments will be optimized towards.
+- -l, --window-length (int, default: 120): Window length for slicing alignments into overlapping windows.
+- -w, --windowslide (int, default: 40): Slide step size controlling window overlap.
+- -s, --samples (int, default: 10): Number of sampling runs per alignment/sequence count.
+- -a, --sample-attempts (int, default: 1000): Number of sampling attempts per alignment.
+- -c, --shuffle-control (store_true, default: False): Use simpler column-based shuffling instead of SISSIz.
+- -H, --hexamer-model (string, default: hexamer_models/Human_hexamer.tsv): Path to the statistical hexamer model to use.
+- -S, --no-structural-filter (string, default: False): Set to True to disable filtering windows by statistical significance of structure. Note: defined as action="store" (string) although conceptually a boolean toggle.
+- -T, --tree (string, default: None): Path to a Newick-formatted species tree for the alignment. If None, a tree may be estimated.
 
-$ import RNA
-
-$ RNA.fold("GGAAAGGTTTGGG")
+### Example
+```bash
+python svhip.py data --coding CodingDir --noncoding NoncodingDir -o features.tsv -n 200 -l 120 -w 40
 ```
 
-If this does not produce any errors, ViennaRNA bindings should be ready to use.
+## svhip train
 
-Following this, we now have to install all the remaining requirements. For this, we provide 
-the environment.yaml with the download. So leave the environment and update it 
-with the missing packages:
+### Purpose
+- Train a machine-learning model (RF, SVM, or LR) on features generated by the data task.
+- Supports optional hyperparameter optimization for SVM and RF.
 
+### Options
+- -i, --input (string): Input features file generated with data (Required).
+- -o, --outfile (string): Prefix for output model files (Required).
+- -M, --model (string, default: RF): Model type. One of RF (Random Forest), SVM (Support Vector Machine), LR (Logistic Regression).
+- --optimize-hyperparameters (store_true, default: False): Perform hyperparameter optimization.
+- --optimizer (string, default: randomwalk): Hyperparameter search strategy: gridsearch (exhaustive) or randomwalk (faster).
+
+### SVM hyperparameters (when model=SVM and optimization enabled)
+- --low-c (int, default: 1): Lowest C value to try.
+- --high-c (int, default: 100): Highest C value to try.
+- --low-gamma (int, default: 1): Lowest gamma value to try.
+- --high-gamma (int, default: 100): Highest gamma value to try.
+- --hyperparameter-steps (int, default: 10): Number of values per hyperparameter (evenly spaced).
+- --logscale (store_true, default: False): Use logarithmic scaling for the parameter grid.
+- --logbase (int, default: 2): Logarithmic base if --logscale is set.
+
+### Random Forest hyperparameters (when model=RF and optimization enabled)
+- --min-trees (int, default: 100): Minimum number of trees (n_estimators) to consider.
+- --max-trees (int, default: 500): Maximum number of trees (n_estimators) to consider.
+- --min-samples-split (int, default: 2): Minimum samples required to split an internal node.
+- --max-samples-split (int, default: 16): Maximum samples to split an internal node.
+- --min-samples-leaf (int, default: 1): Minimum samples required at a leaf node.
+- --max-samples-leaf (int, default: 16): Maximum samples at a leaf node.
+
+### Example
+```bash
+python svhip.py train -i features.tsv -o RF_classifier -M RF --optimize-hyperparameters --optimizer randomwalk
 ```
-$ conda deactivate
 
-$ conda env update -n svhip_env --file environment.yaml
+## svhip windows
 
-$ conda activate svhip_env
+### Purpose
+- Slice an existing alignment into overlapping windows, filtering sequences by identity and gaps.
+
+### Options
+- -i, --input (string): Input alignment file (Required).
+- -o, --outfile (string): Output alignment file for windows (Required).
+- -l, --length (int, default: 120): Window length.
+- -s, --slide (int, default: 80): Slide step size for overlap.
+- --min-id (float, default: 0.5): Minimum pairwise identity of sequences to keep.
+- --max-id (float, default: 0.95): Maximum pairwise identity of sequences to keep.
+- --opt-id (float, default: 0.8): Target identity to optimize sequence selection.
+- -n, --num-seqs (int, default: 6): Maximum number of sequences per window.
+- -g, --max-gaps (float, default: 0.75): Maximum fraction of gaps in the reference sequence.
+
+### Example
+```bash
+python svhip.py windows -i input.aln -o WINDOWS.aln -l 120 -s 80 --min-id 0.5 --opt-id 0.8 -n 6
 ```
 
-Now all the requirements should be in place. You can now run a manual installation of 
-Svhip for this environment by simply executing 
+## svhip predict
 
+### Purpose
+- Predict class labels (coding, non-coding, other) for windows cut from an input alignment using a trained model and hexamer model.
+- Supports MAF or Clustal input; when input ends with .maf, genome coordinates are preserved and can be exported as BED.
+- Processes windows in blocks for efficiency; can scan both strands.
+
+### Options
+- -i, --input (string): Input alignment file, MAF or Clustal (Required).
+- -o, --outfile (string): Output TSV file (Required).
+- -M, --model-path (string, default: ""): Path to the trained model file (Required).
+- -T, --tree (string, default: None): Path to a Newick-formatted species tree; if None, one may be estimated.
+- -H, --hexamer-model (string, default: hexamer_models/Human_hexamer.tsv): Path to the hexamer score model.
+- --both-strands (store_true, default: False): Screen both forward and reverse strands.
+- --bed (store_true, default: False): Merge overlapping annotations and write a BED file. IMPORTANT: Requires MAF input for genomic coordinates.
+- --windows-per-block (int, default: 50): Number of windows processed per block before writing results.
+
+### Example
+```bash
+python svhip.py predict -i query.maf -o predictions.tsv -M RF_classifier.model -H hexamer_models/Human_hexamer.tsv --both-strands --bed
 ```
-$ bash install_svhip.sh
+
+
+## svhip hexcalibrate
+
+### Purpose
+- Calibrate a hexamer model from coding and noncoding sequences; writes a tab-delimited model file.
+
+### Options
+- -c, --coding (string): Fasta file of coding transcripts (must be in-frame).
+- -n, --noncoding (string): Fasta file of noncoding sequences.
+- -o, --outfile (string): Output TSV file for the calibrated hexamer model.
+
+### Example
+```bash
+python svhip.py hexcalibrate -c coding.fa -n noncoding.fa -o Human_hexamer.tsv
 ```
 
-Congrats! By following these steps, you should have a functional installation of Svhip
-without needing the bioconda recipe. You can still check the integrity of the installation
-with:
-```
-$ svhip check
-```
+## External tools and notes
 
-# 4 Manual
-Do not forget to read the manual (included in this repository!).
-
-
-
+- Clustal Omega (clustalo) must be available in PATH for data generation and alignment steps.
+- SISSIz is used for negative control generation when available; if not present or if --shuffle-control is set, a simpler column-shuffling approach is used instead.
+- Randomization is controlled by --seed. If not provided, a random seed is generated at start.
+- When using predict with --bed, ensure the input is MAF to include genomic coordinates.

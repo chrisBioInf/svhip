@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Created on Tue Aug 16 23:15:23 2022
 
@@ -13,12 +12,14 @@ __credits__ = []
 __license__ = "GPLv2"
 __version__="1.0.6"
 __maintainer__ = "Christopher Klapproth"
-__email__ = "christopher@bioinf.uni-leipzig.de"
-__status__ = "Development"
+__email__ = "christopher.klapproth@protonmail.com"
+__status__ = "Release"
 
 
 import os
 import sys
+from pathlib import Path
+import optparse
 from optparse import OptionParser
 import logging
 import numpy as np
@@ -32,11 +33,13 @@ from subprocess import call
 import tempfile
 import re
 import pickle
-from itertools import product
+from itertools import product, combinations
 from math import factorial
+import random
+from joblib import parallel_backend, Parallel, delayed
 
-import seaborn as sns
-import matplotlib.pyplot as plt
+#import seaborn as sns
+#import matplotlib.pyplot as plt
 
 from sklearn import svm
 from sklearn.ensemble import RandomForestClassifier
@@ -47,31 +50,35 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
 
 from Bio import AlignIO, SeqIO, Phylo
-from Bio.Align.Applications import ClustalwCommandline
+# from Bio.Align.Applications import ClustalwCommandline
 from Bio.Align.AlignInfo import SummaryInfo
 from Bio.Align import MultipleSeqAlignment
 from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from Bio.Data import CodonTable
 from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
-from itertools import combinations, product
 import blosum
-import RNA as vienna
+import RNA as RNA
+
+from typing import Optional
 
 
 #########################Default parameters#############################
+
+DEFAULT_THREADS = max(os.cpu_count()-1, 1)
+RANDOM_SEED = random.randint(0, 2**31)
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 RNAz_DIR = os.path.join(THIS_DIR, "RNAz_toolkit")
 hexamer_backup = os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv")
 
 class_dict = {
-    1 : "OTHER",
-    -1: "RNA",
-    0 : "CDS",
-    "OTHER": 1,
-    "ncRNA": -1,
-    "RNA": -1,
-    "CDS": 0,
+    1 : "other",
+    -1: "non-coding",
+    0 : "coding",
+    "other": 1,
+    "non-coding": -1,
+    "coding": 0,
     }
 strand_dict = {
     "forward": "+",
@@ -105,420 +112,50 @@ bins = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 min_len = 50
 max_len = 200
 
+
+
 ################################################
 #
 #               File handling
 #
 ################################################
 
-def is_fasta(filename):
+def is_fasta(filename: str) -> bool:
     with open(filename, "r") as handle:
         fasta = SeqIO.parse(handle, "fasta")
         return any(fasta) 
     
     
-def is_alignment(filename):
+def is_alignment(filename: str) -> bool:
     alignment = AlignIO.read(filename, "clustal")
     return any(alignment)
 
 
-def ungap_sequence(seq):
+def ungap_sequence(seq: str) -> str:
     return re.sub(r'-', "", seq)
 
 
-def filter_windows(filename, edit_distances, cutoff):
-    alignments = AlignIO.parse(filename, "clustal")
-    buffer_file = filename + "_tmp"
-    writer = AlignIO.ClustalIO.ClustalWriter(open(buffer_file, "a"))
-    alignment_count = 0
-        
-    for a in alignments:
-        alignment_count += 1
-        if edit_distances.get(alignment_count) > cutoff:
-            continue
-        writer.write_alignment(a)
-            
-    os.remove(filename)
-    os.rename(buffer_file, filename)
-    
-
-def get_consensus_sequence(alignment):
-    summary = SummaryInfo(alignment)
-    return summary.gap_consensus(threshold=0.4).replace("X", "-")
-
-
-def to_gtf(df, filename):
-    seqname = []
-    source = []
-    type_ = []
-    starts = []
-    ends = []
-    score = []
-    strands = []
-    frame = []
-    descriptor = []
-    
-    def in_range(end, start1, end1):
-        if (start1 < end) and (end < end1):
-            return True
-        return False
-    
-    def find_longest_window(prediction, direction, end, df_, offset):
-        n = 0
-        new_end = end
-        while n < len(df_):
-            if in_range(end, df_["start"].iloc[n], df_["end"].iloc[n]) and (prediction == df_["Prediction"].iloc[n]) and (direction == df_["direction"].iloc[n]):
-                new_end = df_["end"].iloc[n]
-                n += offset
-            else:
-                return new_end, n
-        return new_end, n
-    
-    if "start" not in df.columns:
-        print("No gene coordinate information in file. Cannot generate gtf.")
-    if "end" not in df.columns:
-        print("No gene coordinate information in file. Cannot generate gtf.")
-        
-    offset = len(set(df["direction"]))
-    
-    count = 0
-    i, j = 0, 0
-    
-    if "OTHER" not in df["Prediction"]:
-        df["Prediction"] = [class_dict.get(x, "OTHER") for x in df["Prediction"]]
-    
-    df = df[df["Prediction"] != "OTHER"]
-    df.sort_values(by="start", inplace=True)
-    
-    while (i < len(df)-1) and (j < len(df)-1):
-        j = i+offset
-        prediction = df["Prediction"].iloc[i]
-        direction = df["direction"].iloc[i]
-        end = df["end"].iloc[i]
-        new_end, n = find_longest_window(prediction, direction, end, df[j:], offset)
-        
-        count += 1
-        features = "locus %s;" % count
-        
-        seqname.append(df["chromosome"].iloc[i])
-        source.append("svhip")
-        type_.append(df["Prediction"].iloc[i])
-        starts.append(df["start"].iloc[i])
-        ends.append(new_end)
-        strands.append(strand_dict.get(df["direction"].iloc[i], "+"))
-        frame.append(".")
-        score.append(".")
-        descriptor.append(features) 
-        
-        i = i+n+1
-    
-    if filename.endswith(".tsv"):
-        filename = filename.replace(".tsv", ".gtf")
-    else:
-        filename = filename + ".gtf"
-    
-    with open("%s" % filename, 'w') as f:
-        for i in range(0, len(seqname)):
-            line = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
-                seqname[i], source[i], type_[i], starts[i], ends[i], 
-                score[i], strands[i], frame[i], descriptor[i]
-                )
-            f.write(line + "\n")
-
-
-###############################################
+################################################
 #
-#               Merging of MAF alignment blocks
+#              External function calls
 #
-###############################################
+################################################
 
 
-def print_alignment_simple(records):
-    for i in range(0, len(records)):
-        print(records[i].id)
-        print(str(records[i].seq))
+def clustalo_cmdline(infile: str, outfile: str, threads: int) -> list[str]:
+    print(f"Now aligning: {infile}")
+    cmd = f"clustalo --threads {threads} --output-order=input-order --infmt=fa --outfmt=clu --force -i {infile} -o {outfile}"
+    return shlex.split(cmd)
 
 
-def plot_merge_summary(outfile, block_length_threshold, records, merged_records, merged_blocks_n):
-    lengths = []
-    blocks = []
-    seq_ns = []
-    
-    for record in records:
-        lengths.append(len(record[0].seq))
-        blocks.append("Pre-Merge")
-        seq_ns.append(len(record))
-    for record in merged_records:
-        lengths.append(len(record[0].seq))
-        seq_ns.append(len(record))
-        blocks.append("Post-Merge")
-    
-    data= {
-        "Length": lengths,
-        "Merge status": blocks,
-        "Number of species": seq_ns,
-        "Merged blocks": merged_blocks_n,
-        }
-    fig, ax = plt.subplots(2, 2, figsize=(9, 8))
-    sns.countplot(data=data, x="Merge status", edgecolor='k', ax=ax[0][0], width=0.5)
-    ax[0][0].set_ylabel("Count")
-    sns.boxplot(data=data, x="Merge status", y="Length", ax=ax[0][1])
-    ax[0][1].set_ylabel("Length [nt]")
-    ax[0][1].plot([-1, 2], [block_length_threshold, block_length_threshold], 'k--')
-    ax[0][1].set_yscale("log")
-    sns.boxplot(data=data, x="Merge status", y="Number of species", ax=ax[1][0], width=0.5)
-    ax[1][0].set_ylabel("Number of Species")
-    sns.histplot(data=data, x="Merged blocks", stat='probability', ax=ax[1][1])
-    ax[1][1].set_ylabel("Probability")
-    plt.savefig("%s_merge.pdf" % outfile, dpi=300, bbox_inches="tight")
-    plt.savefig("%s_merge.svg" % outfile, dpi=300, bbox_inches="tight")
-
-
-def print_similarity_matrix(matrix, records):
-    record_labels = [str(record.id) for record in records]
-    similarity_columns = {}
-    
-    for i in range(0, len(record_labels)):
-        similarity_columns[record_labels[i]] = matrix[i]
-    
-    df = pd.DataFrame(data=similarity_columns, index=similarity_columns).round(4)
-    start, end = records[i].annotations["start"], records[i].annotations["start"] + records[i].annotations["size"]
-    df.to_csv("Similarity_matrices/dmel_%s_%s.tsv" % (start, end), sep="\t")
-    return df
-    
-
-def load_alignment_file(filename):
-    try:
-        handle = AlignIO.parse(handle=open(filename, 'r'), format="maf")
-        alignments = [align for align in handle]
-        return alignments
-    except Exception:
-        print("Failed to load alignment. Is this a MAF file?")
-        sys.exit()
-
-
-def write_alignments(alignments, filename):
-    AlignIO.write([MultipleSeqAlignment(records=records) for records in alignments], 
-                  handle=open(filename, 'w'), 
-                  format="maf")
-
-
-def coordinate_distance(end1, start2):
-    return start2 - end1
-
-
-def pairwise_sequence_identity(seq1, seq2):
-    count = 0
-    for i in range(0, len(seq1)):
-        if seq1[i] == seq2[i]:
-            count += 1
-    return count / len(seq1)
-    
-
-def local_species_consensus(block1, block2):
-    block1_ids = set([str(seq.id) for seq in block1])
-    block2_ids = set([str(seq.id) for seq in block2])
-    consensus_score  = (len(block1_ids.intersection(block2_ids)) + len(block2_ids.intersection(block1_ids))) / (len(block1_ids) + len(block2_ids))
-    return consensus_score
-
-
-def concat_with_bridge(seq1, seq2, offset):
-    seq_ = Seq(str(seq1) + "N"*offset + str(seq2)) 
-    return seq_
-
-
-def fill_bridges_with_gaps(records):
-    length_dict = {}
-    seq_dict = {}
-    for i in range(0, len(records)):
-        length_dict[str(records[i].id)] = len(records[i].seq)
-        seq_dict[str(records[i].id)] = str(records[i].seq)
-    longest_seq_key = max(length_dict, key=length_dict.get)
-    longest_seq = seq_dict.get(longest_seq_key)
-    max_length = length_dict.get(longest_seq)
-    
-    for i in range(0, len(records)):
-        if len(records[i].seq) == max_length:
-            continue
-        seq = str(records[i].seq)
-        seq_ = ""
-        j = 0
-        
-        for n in range(0, len(longest_seq)):
-            if longest_seq[n] != "N":
-                seq_ = seq_ + seq[j]
-                j += 1
-            else:
-                seq_ = seq_ + "-"
-        records[i].seq = Seq(seq_)
-    
-    return records
-
-
-def eliminate_consensus_gaps(records):
-    ungapped_seqs = []
-    for i in range(0, len(records)):
-        seq = str(records[i].seq)
-        seq_ = ""
-        for c in range(0, len(seq)):
-            if seq[c] != "-":
-                seq_ = seq_ + seq[c]
-                continue
-            for j in range(0, len(records)):
-                seq_2 = str(records[j].seq)
-                if seq_2[c] != "-":
-                    seq_ = seq_ + seq[c]
-                    break
-        ungapped_seqs.append(seq_)
-    
-    for i in range(0, len(records)):
-        records[i].seq = Seq(ungapped_seqs[i])
-    
-    return records
-    
-
-def filter_by_pairwise_id(records):
-    seqs = [str(record.seq) for record in records]
-    ids = [str(record.id) for record in records]
-    matrix = np.ones(shape=(len(records), len(records)))
-    
-    for i in range(0, len(records)-1):
-        record_ = records[i]
-        seq = str(record_.seq)
-        id_ = str(record_.id)
-        for j in range(i+1, len(records)):
-            seq_ = str(records[j].seq)
-            pairwise_id = pairwise_sequence_identity(seq, seq_)
-            matrix[i][j] = pairwise_id
-            matrix[j][i] = pairwise_id
-            
-    return matrix
-
-
-def filter_by_seq_length(records):
-    length_dict = {str(record.id) : len(record.seq.replace('-', '')) for record in records}
-    record_dict = {str(record.id) : record for record in records}
-    mu = np.mean([x for x in length_dict.values()])
-    std = np.std([x for x in length_dict.values()])
-    
-    for record in records[1:]:
-        x = str(record.id)
-        if std > 0:
-            z = abs(length_dict.get(x) - mu) / std
-        else:
-            z = 0
-        if z > 2:
-            record_dict.pop(x)
-    
-    return [record for record in record_dict.values()]
-
-
-def merge_blocks(block1, block2, offset_threshold):
-    block1_ids = [str(record.id) for record in block1]
-    block2_ids = [str(record.id) for record in block2]
-    
-    if len(block1_ids) >= len(block2_ids):
-        consensus_blocks = set(block1_ids).intersection(block2_ids)
+def generate_control_alignment(inpath: str, outpath: str, sissiz_shuffle: bool=False) -> None:
+    if sissiz_shuffle:
+        with open(outpath, "w+") as outf:
+            cmd = "SISSIz -n 1 -s --flanks 1750 %s" % inpath
+            subprocess.call(shlex.split(cmd), stdout=open(outpath, "w"))
     else:
-        consensus_blocks = set(block2_ids).intersection(block1_ids)
-    
-    block1_records = [record for record in block1 if record.id in consensus_blocks]
-    block2_records = [record for record in block2 if record.id in consensus_blocks]
-    merged_records = []
-    
-    for i in range(0, len(block1_records)):
-        record_, record2 = block1_records[i], block2_records[i]
-        strand1, strand2 = record_.annotations["strand"], record2.annotations["strand"]
-        start1, end1 = record_.annotations["start"], record_.annotations["start"] + record_.annotations["size"]
-        start2, end2 = record2.annotations["start"], record2.annotations["start"] + record2.annotations["size"]
-        offset = coordinate_distance(end1, start2)
-        if (offset > offset_threshold) or (strand1 != strand2):
-            continue
-        record_.seq = concat_with_bridge(record_.seq, record2.seq, offset)
-        record_.annotations["size"] = (end1 - start1) + offset + (end2 - start2)
-        merged_records.append(record_)
-    merged_records = fill_bridges_with_gaps(merged_records)
-    matrix = filter_by_pairwise_id(merged_records)
-    # df = print_similarity_matrix(matrix, merged_records)
-    record_dict = {str(record.id) : record for record in merged_records}
-    
-    return merged_records
+        shuffle_alignment_file(input_file=inpath, output_file=outpath)
 
-
-def check_block_viability(block1, block2, block_length_threshold, species_consensus_threshold, block_distance_threshold, ):
-    merge_flag = True
-    reference1 = block1[0]
-    reference2 = block2[0]
-    start1, end1 = reference1.annotations["start"], reference1.annotations["start"] + reference1.annotations["size"]
-    start2, end2 = reference2.annotations["start"], reference2.annotations["start"] + reference2.annotations["size"]
-    
-    if coordinate_distance(end1, start2) > block_distance_threshold:
-        # print("Coordinate distance")
-        merge_flag = False
-    elif reference1.annotations["strand"] != reference2.annotations["strand"]:
-        # print("Wrong strand")
-        merge_flag = False
-    elif (len(reference1.seq) > block_length_threshold) or (len(reference2.seq) > block_length_threshold):
-        # print("Already too long")
-        merge_flag = False
-    elif local_species_consensus(block1, block2) < species_consensus_threshold:
-        # print("No species consensus")
-        merge_flag = False
-    elif reference1.id != reference2.id:
-        merge_flag = False
-         
-    return merge_flag
-
-
-def merge_maf_blocks(options):
-    block_length_threshold = options.block_length
-    species_consensus_threshold = options.consensus_threshold
-    block_distance_threshold = options.distance_threshold
-    
-    alignments = load_alignment_file(options.in_file)
-    merged_alignments = []
-    i = 0
-    block1 = alignments[0]
-    merged_blocks_n = []
-    local_merges = 1
-    
-    length = len(alignments)
-    
-    while i < length-1:
-        print("Scan MAF block: %s / %s" % (i+1, length))
-        block2 = alignments[i+1]
-        merge_flag = check_block_viability(block1, block2, 
-                                           block_length_threshold,
-                                           species_consensus_threshold,
-                                           block_distance_threshold, 
-                                           )
-        
-        if merge_flag == True: 
-            block1 = merge_blocks(block1, block2, block_distance_threshold)
-            local_merges += 1
-            i += 1
-        else:
-            records = filter_by_seq_length(block1)
-            records = eliminate_consensus_gaps(records)
-            merged_alignments.append(records)
-            merged_blocks_n.append(local_merges)
-            i += 1
-            local_merges = 1
-            block1 = alignments[i]
-            
-    if merge_flag == False:
-        merged_alignments.append(eliminate_consensus_gaps(filter_by_seq_length(alignments[-1])))
-            
-    if options.out_file.endswith(".maf"):
-        outfile = options.out_file
-    else:
-        outfile = options.out_file + ".maf"
-    
-    plot_merge_summary(options.in_file, block_length_threshold,
-                       alignments, 
-                       merged_alignments, merged_blocks_n,
-                       )
-    write_alignments(merged_alignments, outfile)
 
 
 ###############################################
@@ -527,914 +164,410 @@ def merge_maf_blocks(options):
 #
 ###############################################
 
+# !!!!!  EDITED FROM:
+# altschulEriksonDinuclShuffle.py
+# P. Clote, Oct 2003
+# NOTE: One cannot use function "count(s,word)" to count the number
+# of occurrences of dinucleotide word in string s, since the built-in
+# function counts only nonoverlapping words, presumably in a left to
+# right fashion.
 
-def multiset_coefficient(num_elements, cardinality):
-    """Return multiset coefficient.
+def computeCountAndLists(s: str) -> tuple[dict[str, int], dict[str, dict[str, int]], dict[str, list[str]]]:
+    #WARNING: Use of function count(s,'UU') returns 1 on word UUU
+    #since it apparently counts only nonoverlapping words UU
+    #For this reason, we work with the indices.
 
-      num_elements      num_elements + cardinality - 1
-    ((            )) = (                              )
-      cardinality                cardinality
-    """
-    if num_elements < 1:
-        raise ValueError('num_elements has to be an int >= 1')
-    ret = factorial(num_elements+cardinality-1)
-    ret //= factorial(cardinality)
-    ret //= factorial(num_elements-1)
-    return ret
+    #Initialize lists and mono- and dinucleotide dictionaries
+    ls = {} #List is a dictionary of lists
+    ls['A'] = []; ls['C'] = []
+    ls['G'] = []; ls['U'] = []
+    nuclList   = ["A","C","G","U"]
+    s       = s.upper()
+    s       = s.replace("T","U")
+    nuclCnt    = {}  #empty dictionary
+    dinuclCnt  = {}  #empty dictionary
+    for x in nuclList:
+        nuclCnt[x]=0
+        dinuclCnt[x]={}
+        for y in nuclList:
+            dinuclCnt[x][y]=0
 
-def multiset_multiplicities(num_elements, cardinality):
-    """Generator function for element multiplicities in a multiset.
+    #Compute count and lists
+    nuclCnt[s[0]] = 1
+    nuclTotal     = 1
+    dinuclTotal   = 0
+    for i in range(len(s)-1):
+        x = s[i]; y = s[i+1]
+        ls[x].append( y )
+        nuclCnt[y] += 1; nuclTotal  += 1
+        dinuclCnt[x][y] += 1; dinuclTotal += 1
+    assert (nuclTotal==len(s))
+    assert (dinuclTotal==len(s)-1)
+    return nuclCnt,dinuclCnt,ls
+ 
+ 
+def chooseEdge(x: str, dinuclCnt: dict[str, dict[str, int]]) -> str:
+    numInList = 0
+    for y in ['A','C','G','U']:
+        numInList += dinuclCnt[x][y]
+    z = random.random()
+    denom=dinuclCnt[x]['A']+dinuclCnt[x]['C']+dinuclCnt[x]['G']+dinuclCnt[x]['U']
+    numerator = dinuclCnt[x]['A']
+    if z < float(numerator)/float(denom):
+        dinuclCnt[x]['A'] -= 1
+        return 'A'
+    numerator += dinuclCnt[x]['C']
+    if z < float(numerator)/float(denom):
+        dinuclCnt[x]['C'] -= 1
+        return 'C'
+    numerator += dinuclCnt[x]['G']
+    if z < float(numerator)/float(denom):
+        dinuclCnt[x]['G'] -= 1
+        return 'G'
+    dinuclCnt[x]['U'] -= 1
+    return 'U'
 
-    Arguments:
-    - num_elements -- number of different elements the multisets are chosen from
-    - cardinality -- cardinality of the multisets
-    """
-    if cardinality < 0:
-        raise ValueError('expected cardinality >= 0')
-    if num_elements == 1:
-        yield (cardinality,)
-    elif num_elements > 1:
-        for count in range(cardinality+1):
-            for other in multiset_multiplicities(num_elements-1,
-                                                 cardinality-count):
-                yield (count,) + other
-    else:
-        raise ValueError('expected num_elements >= 1')
-
-def multinomial_coefficient(*args):
-    """Return multinomial coefficient.
-
-     sum(k_1,...,k_m)!
-    (                 )
-      k_1!k_2!...k_m!
-    """
-    if len(args) == 0:
-        raise TypeError('expected at least one argument')
-    ret = factorial(sum(args))
-    for arg in args:
-        ret //= factorial(arg)
-    return ret
-
-"""Custom error classes."""
-
-class SequenceTypeError(Exception):
-    """Raised if a sequence type is neither RNA or DNA.
-
-    RNA and DNA are string constants defined in zscore/literals.py.
-    """
-    pass
-
-class DefaultValueError(Exception):
-    """Raised if a value in zscore/defaults.py fails a validity check."""
-    pass
-
-# Type of nucleic acid.
-DNA = 'DNA'
-RNA = 'RNA'
-
-# Nucleotide symbols.
-A = 'A'
-C = 'C'
-G = 'G'
-T = 'T'
-U = 'U'
-
-# DNA nucleotides.
-DNA_NUCLEOTIDES = (A, C, G, T)
-
-# RNA nucleotides.
-RNA_NUCLEOTIDES = (A, C, G, U)
-
-# Dinucleotides.
-AA = 'AA'
-AC = 'AC'
-AG = 'AG'
-AT = 'AT'
-AU = 'AU'
-CA = 'CA'
-CC = 'CC'
-CG = 'CG'
-CT = 'CT'
-CU = 'CU'
-GA = 'GA'
-GC = 'GC'
-GG = 'GG'
-GT = 'GT'
-GU = 'GU'
-TA = 'TA'
-TC = 'TC'
-TG = 'TG'
-TT = 'TT'
-UA = 'UA'
-UC = 'UC'
-UG = 'UG'
-UU = 'UU'
-
-# DNA dinucleotides.
-DNA_DINUCLEOTIDES = (AA, AC, AG, AT, CA, CC, CG, CT, GA, GC, GG, GT, TA, TC, TG, TT)
-
-# RNA dinucleotides.
-RNA_DINUCLEOTIDES = (AA, AC, AG, AU, CA, CC, CG, CU, GA, GC, GG, GU, UA, UC, UG, UU)
-
-from re import (
-    escape,
-    findall
-)
-
-def doublet_counts(sequence, doublets):
-    """Return dict of observed doublet counts in given sequence."""
-    counts = dict()
-    for d in doublets:
-        counts[d] = len(findall('(?={0})'.format(escape(d)), sequence))
-    return counts
-
-class ZGraphs():
-    """
-    Container for valid Z graphs.
-
-    Arguments:
-    -- z_vertices: elements in sequence not equal to last element in sequence
-    -- last: last element in sequence
-    """
-
-    def __init__(self, vertices, last):
-        if not (2 <= len(vertices) <= 4):
-            raise TypeError('expected sequence of 2, 3 or 4 unique elements '
-                            'but got {0} {1}'.format(
-                                len(vertices),sorted(list(vertices))))
-        if last not in vertices:
-            raise ValueError('expected last to be in vertices')
-        self.vertices = vertices
-        self.last = last
-        self.nonlast_vertices = sorted(set(vertices).difference(self.last))
-        self.valid = self._create_valid(self.vertices, self.nonlast_vertices,
-                                        self.last)
-
-    def _create_valid(self, vertices, nonlast_vertices, last):
-        z_graphs = []
-        for ends in product(*(vertices for _ in range(len(nonlast_vertices)))):
-            z_graph = dict(e for e in zip(nonlast_vertices, ends))
-            if self._valid(z_graph, last):
-                z_graphs.append(z_graph)
-        return tuple(z_graphs)
-
-    def _valid(self, z_graph, last):
-        if len(z_graph) > 3:
-            raise TypeError('expected z_graph to be a dict representing at '
-                            'most 3 last edges')
-        connected = True
-        for tail, head in z_graph.items():
-            if head != last:
-                head2 = z_graph.get(head)
-                if head2 != last:
-                    head3 = z_graph.get(head2)
-                    if head3 != last:
-                        connected = False
-                        break
-        return connected
-
-    def check(self, z_graph):
-        """Returns true if a Z graph is valid."""
-        return z_graph in self.valid
+def connectedToLast(edgeList: list[list[str]], nuclList: list[str], lastCh: str) -> int:
+    D = {}
+    for x in nuclList: D[x]=0
+    for edge in edgeList:
+        a = edge[0]; b = edge[1]
+        if b==lastCh: D[a]=1
+    for i in range(2):
+        for edge in edgeList:
+            a = edge[0]; b = edge[1]
+            if D[b]==1: D[a]=1
+    ok = 0
+    for x in nuclList:
+        if x!=lastCh and D[x]==0: return 0
+    return 1
 
 
-class DoubletGraph:
-    """
-    Doublet Graph of a sequence.
-
-    A doublet of a sequence is any pair of successive elements in the sequence.
-    A doublet graph of a sequence is an ordered directed multigraph.
-    In such a graph the vertices are the unique elements of the sequence and
-    the directed edges are the doublets in that sequence with direction from
-    sequence start to sequence end.
-
-    Arguments:
-    -- sequence: string representation of the sequence
-    """
-
-    def __init__(self, rng, sequence):
-        self.rng = rng
-        try:
-            self.first = sequence[0]
-        except IndexError:
-            raise TypeError('expected seqeunce to be a non-empty string')
-        self.last = sequence[-1]
-        self.edges = tuple(e for e in zip(sequence, sequence[1:]))
-        self.vertices = sorted(set(sequence))
-        self.z_graphs = ZGraphs(self.vertices, self.last)
-        self.nonlast_vertices = self.z_graphs.nonlast_vertices
-        self.edgelists = self._create_edgelists(self.vertices, self.edges)
-        self.edgemultiplicities = self._create_edgemultiplicites(
-            self.vertices, self.edgelists)
-        self.possible_z_graphs = self._create_possible_z_graphs()
-
-    def _create_edgelists(self, vertices, edges):
-        ret = dict((v,[]) for v in vertices)
-        for start, end in edges:
-            ret.get(start).append(end)
-        for v, l in ret.items():
-            ret[v] = tuple(l)
-        return ret
-
-    def _create_edgemultiplicites(self, vertices, edgelists):
-        ret = dict()
-        for v, l in edgelists.items():
-            m = dict((v, l.count(v)) for v in vertices)
-            ret[v] = m
-        return ret
-
-    def _create_possible_z_graphs(self):
-        ret = []
-        for z in self.z_graphs.valid:
-            possible = True
-            for v in self.nonlast_vertices:
-                if z.get(v) not in self.edgelists.get(v):
-                    possible = False
-                    break
-            if possible:
-                ret.append(z)
-        return ret
-
-    def num_permutations(self):
-        total = 0
-        for z in self.possible_z_graphs:
-            subtotal = 1
-            for v in z:
-                last = z.get(v)
-                multiplicities = self.edgemultiplicities.get(v).copy()
-                multiplicities[last] -= 1
-                subtotal *= multinomial_coefficient(*multiplicities.values())
-            subtotal *= multinomial_coefficient(
-                *self.edgemultiplicities.get(self.last).values())
-            total += subtotal
-        return total
-
-    def random_z_graph(self):
-        while(True):
-            ret = dict()
-            for start in self.nonlast_vertices:
-                end = self.rng.choice(self.edgelists.get(start))
-                ret[start] = end
-            if self.z_graphs.check(ret):
-                return ret
+def eulerian(s: str) -> tuple[int, list[list[str]], list[str], str]:
+    nuclCnt,dinuclCnt,ls = computeCountAndLists(s)
+    #compute nucleotides appearing in s
+    nuclList = []
+    for x in ["A","C","G","U"]:
+        if x in s: nuclList.append(x)
+    #compute numInList[x] = number of dinucleotides beginning with x
+    numInList = {}
+    for x in nuclList:
+        numInList[x]=0
+        for y in nuclList:
+            numInList[x] += dinuclCnt[x][y]
+    #create dinucleotide shuffle L
+    firstCh = s[0]  #start with first letter of s
+    lastCh  = s[-1]
+    edgeList = []
+    for x in nuclList:
+        if x!= lastCh: edgeList.append( [x,chooseEdge(x,dinuclCnt)] )
+    ok = connectedToLast(edgeList,nuclList,lastCh)
+    return ok,edgeList,nuclList,lastCh
 
 
-class DPPermutations:
-    """
-    Doublet preserving permutations of a sequence.
+def shuffleEdgeList(L: list[str]) -> list[str]:
+    n = len(L); barrier = n
+    for i in range(n-1):
+        z = int(random.random() * barrier)
+        tmp = L[z]
+        L[z]= L[barrier-1]
+        L[barrier-1] = tmp
+        barrier -= 1
+    return L
 
-    The cardinality of the alphabet must be <= 4 as is the case in DNA or RNA.
 
-    Arguments:
-    -- sequence: string representation of the sequence.
-    """
+def dinuclShuffle(s: str) -> str:
+    ok = 0
+    while not ok:
+        ok,edgeList,nuclList,lastCh = eulerian(s)
+    nuclCnt,dinuclCnt,ls = computeCountAndLists(s)
 
-    def __init__(self,
-                 rng,
-                 sequence,
-                 sequence_type,
-                 sequence_length,
-                 di_features):
-        self.rng = rng
-        self.sequence = "".join([x for x in  sequence.upper() if x in nucleotides])
-        self.length = sequence_length
-        self.sequence_type = sequence_type
-        if self.sequence_type == RNA:
-            self.DINUCLEOTIDES = RNA_DINUCLEOTIDES
-        elif self.sequence_type == DNA:
-            self.DINUCLEOTIDES = DNA_DINUCLEOTIDES
-        else:
-            raise SequenceTypeError
-        if self.length <= 3 or len(set(sequence)) <= 1:
-            self.trivial = True
-        else:
-            self.trivial = False
-            self.g = DoubletGraph(rng=self.rng, sequence=self.sequence)
-            if di_features == None:
-                self.dcounts = doublet_counts(self.sequence, self.DINUCLEOTIDES)
-            else:
-                self.dcounts = di_features
+    #remove last edges from each vertex list, shuffle, then add back
+    #the removed edges at end of vertex lists.
+    for [x,y] in edgeList: ls[x].remove(y)
+    for x in nuclList: shuffleEdgeList(ls[x])
+    for [x,y] in edgeList: ls[x].append(y)
 
-    def num_permutations(self):
-        return 1 if self.trivial else self.g.num_permutations()
-            
-    def shuffle(self):
-        if self.trivial:
-            return self.sequence
-        else:
-            last_edges = self.g.random_z_graph()
-            edgelists = dict((v, list(l)) for v,l in self.g.edgelists.items())
-            for start, end in last_edges.items():
-                edgelists.get(start).remove(end)
-            for v in self.g.vertices:
-                self.rng.shuffle(edgelists.get(v))
-            for start, end in last_edges.items():
-                edgelists.get(start).append(end)
-            ret = self.g.first
-            for _ in range(self.length - 1):
-                ret += edgelists.get(ret[-1]).pop(0)
-            if self.dcounts != doublet_counts(ret, self.DINUCLEOTIDES):
-                raise RuntimeError(
-                    'Something went very wrong! '
-                    'Shuffled sequence is not doublet preserving.')
-            return ret
+    #construct the eulerian path
+    L = [s[0]]; prevCh = s[0]
+    for i in range(len(s)-2):
+        ch = ls[prevCh][0] 
+        L.append( ch )
+        del ls[prevCh][0]
+        prevCh = ch
+    L.append(s[-1])
+    t = str().join(L)
+    return t
 
 
 ################################################
 #
-#               RNAz/SISSIz helper functions
+#              Helper functions
 #
 ################################################
 
 
-def shuffle_control(inpath, outpath):
-    with open(outpath, "w+") as outf:
-        cmd = "perl %s %s" % (os.path.join(RNAz_DIR, "rnazRandomizeAln.pl"), inpath)
-        call(shlex.split(cmd), stdout=open(outpath, "w"))
-    return 0
+bp_dict = {
+    'A': 'U',
+    'U': 'A',
+    'T': 'A',
+    'G': 'C',
+    'C': 'G',
+}
+
+def get_reverse_complement(seq: str) -> str: 
+    return str().join([bp_dict.get(x, x) for x in reversed(seq)])
 
 
-def generate_control_alignment(inpath, outpath, shuffle=False):
-    if shuffle:
-        shuffle_control(inpath, outpath)
-        return 0
-    with open(outpath, "w+") as outf:
-        cmd = "SISSIz -n 1 -s --flanks 1750 %s" % inpath
-        call(shlex.split(cmd), stdout=open(outpath, "w"))
-    return 0
-
-
-def select_seqs(filepath, identity, seqs):
-    tmp_file = filepath+"_tmp"
-    script_path = os.path.join(RNAz_DIR, ('rnazSelectSeqs.pl'))
-    cmd = "perl %s --max-id=%s --num-seqs=%s %s" % (script_path, 
-                                                    identity, 
-                                                    seqs, 
-                                                    filepath) 
-    call(shlex.split(cmd), stdout=open(tmp_file, "w"))
+def calculate_pairwise_identity(seq1: str, seq2: str) -> float:
+    """
+    Calculate pairwise sequence identity between two sequences.
     
-    if is_alignment(tmp_file):
-        os.remove(filepath)
-        os.rename(tmp_file, filepath)
-    else:    
-        print("Careful: Sequence filtering failed for some reason. We will proceed with the full alignment.")
-
-
-############################# Slice Alignments ###########################
-"""
-For {2..12} sequences create 10 alignments with random average pairwise 
-identity in interval d = [50..95].
-Note: Max. deviation in seq. length should be 65%, even though that still 
-seems pretty excessive / previous screening if necessary. --TODO
-
-"""
-def alignment_windows(filepath, options):
-    windows_directory = filepath+"_windows"
-    
-    if not os.path.isdir(windows_directory):
-        os.mkdir(windows_directory)
-    
-    script_path = os.path.join(RNAz_DIR, ('rnazWindow.pl'))
-    outfiles = []
-    
-    for n in range(2, 12+1):
-        for i in range(0, options.n_windows):
-            avg_identity = np.random.randint(low=50, high=95)
-            align_id = "align_%s_%s" % (n, i+1)
-            outpath = os.path.join(windows_directory, align_id)
-            cmd =  'perl %s --min-id=50 --opt-id=%s --window=%s --slide=%s --no-reference --min-seqs=%s --max-seqs=%s --num-samples=1 %s' % (
-                script_path, 
-                avg_identity,
-                options.window_length,
-                options.slide,
-                n,
-                n,
-                filepath
-                ) 
-            
-            call(shlex.split(cmd), stdout=open(outpath, "w"))
-            if check_file(outpath):
-                outfiles.append(outpath)
+    Args:
+        seq1, seq2: Bio.Seq objects or strings
         
-    return outfiles
+    Returns:
+        float: Identity as fraction (0.0 to 1.0)
+    """
+    seq1_str = str(seq1).upper()
+    seq2_str = str(seq2).upper()
+    
+    if len(seq1_str) != len(seq2_str):
+        raise ValueError("Sequences must be of equal length for alignment")
+    
+    if len(seq1_str) == 0:
+        return 0.0
+    
+    # Count matches (excluding gaps)
+    matches = 0
+    valid_positions = 0
+    
+    for c1, c2 in zip(seq1_str, seq2_str):
+        # Skip positions where either sequence has a gap
+        if c1 != '-' and c2 != '-':
+            valid_positions += 1
+            if c1 == c2:
+                matches += 1
+    
+    return matches / valid_positions if valid_positions > 0 else 0.0
 
 
-############# Shuffle alignment with structure conservation ############
-
-def shuffle_alignment(filepath):
-    outpath = filepath+"_shuffled"
-    script_path = os.path.join(RNAz_DIR, 'rnazRandomizeAln.pl')
-    cmd = "perl %s --level=0 %s" % (script_path, filepath)
-    call(shlex.split(cmd), stdout=open(outpath, "w"))
-    return outpath
-
-
-##############################calculate parameters######################
-
-
-def calculate_ShannonEntropy(seqs):
-    '''
-    Entropy is approximated by observing the total entropy of all individual columns using
-    the relative frequency of nucleotides per column. 
-    '''
-    N = 0.0
-    N += len(seqs[0])
-    svalues = []
-    for i in range(0, len(str(seqs[0]))):
-        nA, nU, nG, nC, gap, none = 0, 0, 0, 0, 0, 0
-        nucs_dict = {
-            "A": nA,
-            "U": nU,
-            "T": nU,
-            "G": nG,
-            "C": nC,
-            "-": gap,
-            "\n": none,
-            " ": none
-        }
-        for a in range(0, len(seqs)):
-            if i < len(seqs[a]):
-                literal = nucs_dict.get(seqs[a][i])
-                if literal is not None:
-                    literal_count = literal + 1
-                    nucs_dict[seqs[a][i]] = literal_count
-                else:
-                    pass
-        sA = float(nucs_dict.get('A')/N)*np.log2(float(nucs_dict.get('A')/N))
-        sU = float(nucs_dict.get('U')/N)*np.log2(float(nucs_dict.get('U')/N))
-        sG = float(nucs_dict.get('G')/N)*np.log2(float(nucs_dict.get('G')/N))
-        sC = float(nucs_dict.get('C')/N)*np.log2(float(nucs_dict.get('C')/N))
-        svalues.append(sum([sA, sG, sC, sU]))
+def get_max_identity_in_set(records: list[SeqRecord]) -> float:
+    """
+    Calculate the maximum pairwise identity within a set of records.
+    
+    Args:
+        records: List of SeqRecord objects
         
-    return -float(1/N)* sum(svalues)
-
-
-############################ Check if a produced file is empty ###########
-
-def check_file(filename):
-    if not os.path.isfile(filename):
-        return False
-    if not os.path.getsize(filename) > 0:
-        os.remove(filename)
-        return False
+    Returns:
+        float: Maximum pairwise identity in the set
+    """
+    if len(records) < 2:
+        return 0.0
     
-    return True
-
-
-################################################
-#   
-#               Tree edit distance handling
-#
-################################################
-
-def ungap_sequence(seq):
-    return re.sub(r'-', "", seq)
-
-
-def shuffle_alignment_columns(seqs):
-    indices = list(range(0, min([len(seq) for seq in seqs])))
-    shuffle(indices)
+    max_identity = 0.0
+    for rec1, rec2 in combinations(records, 2):
+        identity = calculate_pairwise_identity(rec1.seq, rec2.seq)
+        max_identity = max(max_identity, identity)
     
-    for i in range(0, len(seqs)):
-        seqs[i] = str().join([seqs[i][n] for n in indices])
-        
-    return seqs
+    return max_identity
 
 
-def fold_rna(seq):
-    fc = vienna.fold_compound(seq)
-    mfe_struct, mfe = fc.mfe()
-    seq_ex = vienna.expand_Full(mfe_struct)
-    return (seq_ex, mfe, mfe_struct)
-
-    
-def calculate_tree_edit_dist(seq1, seq2):
-    seq_struc1, seq_struc2 = fold_rna(seq1)[0], fold_rna(seq2)[0]
-    seq_tree1, seq_tree2 = vienna.make_tree(seq_struc1), vienna.make_tree(seq_struc2)
-    return vienna.tree_edit_distance(seq_tree1, seq_tree2)
-
-
-def calculate_mean_distance(seq_list):
-    '''
-    In case there are empty alignments created by RNAzWindow, which happens
-    depending on set parameters for that run, 0 is returned. Zero-values are
-    later removed from distance vector.
-    Note: "Real" zero-alignments i.e. all sequences are equal can only be
-    created if all input sequences in total are equal, so that should not be an
-    issue.
-    '''
+def calculate_mean_distance(seq_list: list[str]) -> float:
     if len(seq_list) < 2:
         return 0
         
     distance_vector =[]
     for i in range(0, len(seq_list)-1):
         for a in range(i+1, len(seq_list)):    
-            seq_struc1, seq_struc2 = fold_rna(seq_list[i])[0], fold_rna(seq_list[a])[0]
-            seq_tree1, seq_tree2 = vienna.make_tree(seq_struc1), vienna.make_tree(seq_struc2)
-            distance_vector.append(vienna.tree_edit_distance(seq_tree1, seq_tree2))
+            seq_struc1, seq_struc2 = RNA.fold_rna(seq_list[i])[0], RNA.fold_rna(seq_list[a])[0]
+            seq_tree1, seq_tree2 = RNA.make_tree(seq_struc1), RNA.make_tree(seq_struc2)
+            distance_vector.append(RNA.tree_edit_distance(seq_tree1, seq_tree2))
             
-    return np.mean(a=distance_vector)
-
+    return float(np.mean(a=distance_vector))
 
 
 
 ################################################
 #
-#               Plotting functions
+#              Alignment methods (shuffling, sequence selection, windows)
 #
 ################################################
 
 
-limit_dict = {
-    "SCI": (-0.1, 1.1),
-    "z-score of MFE": (-10, 1),
-    "Shannon-entropy": (-2, 2), 
-    }
-
-def plot_tree_edit_distribution(vector, edit_distances, out_path,):
-    name = os.path.join(out_path, "tree_edit_distances")
-    data = {
-        "tree edit distance": vector + edit_distances,
-        "class": ["control"]*len(vector) + ["input"]*len(edit_distances)
-        }
-    if len(data.get("tree edit distance")) < 5:
-        return None
-    print("%s.pdf" % name)
-    print(data)
-    sns.set_style("dark")
-    sns.displot(data=data,x="tree edit distance", hue="class", kde=True,)
-    plt.xlabel("tree edit distance")
-    plt.ylabel("count")
-    plt.savefig("%s.pdf" % name, dpi=300, bbox_inches="tight")
-    plt.savefig("%s.svg" % name, dpi=300, bbox_inches="tight")
-    plt.clf()
-
-
-def feature_boxplot(df, out_path):
-    # TODO: There is an easier way to "extend" the dataframe to a long format somewhere...
-    values = [x for x in pd.concat([df["SCI"], df["z-score of MFE"], df["Shannon-entropy"], ])]
-    classes = list(df["Class"])*3
-    features = ["SCI"]*len(df["SCI"]) + ["z-score of MFE"]*len(df["z-score of MFE"]) + ["Shannon-entropy"]*len(df["Shannon-entropy"]) 
-    long_df = pd.DataFrame(data={
-        "value": values,
-        "Class": classes,
-        "feature": features,
-        })
-    sns.boxplot(data=long_df, x="feature", y="value", hue="Class")
-    plt.xlabel("")
-    plt.xticks(rotation=45)
-    plt.savefig(out_path +"/features_boxplot.svg", dpi=300, bbox_inches="tight")
-    plt.savefig(out_path +"/features_boxplot.pdf", dpi=300, bbox_inches="tight")
-    plt.clf()
-
+def shuffle_alignment_columns(alignment: MultipleSeqAlignment) -> MultipleSeqAlignment:
+    """
+    Read a CLUSTAL alignment, shuffle its columns, and write the result.
     
-def plot_feature_distribution(df, out_path):
-    # df["Class"] = [class_dict.get(a) for a in df["Class"]]
-    df.index = list(range(0, len(df)))
+    Args:
+        input_file (str): Path to input CLUSTAL alignment file
+        output_file (str): Path to output CLUSTAL alignment file  
+    """
+    # Get alignment dimensions
+    num_sequences = len(alignment)
+    alignment_length = alignment.get_alignment_length()
     
-    if not os.path.isdir(out_path):
-        os.mkdir(out_path)
+    # Create list of column indices and shuffle them
+    column_indices = list(range(alignment_length))
+    random.shuffle(column_indices)
     
-    sns.set_theme(style="ticks")
-    sns.jointplot(data=df, x="SCI", y="z-score of MFE", hue="Class")  
-    plt.savefig(out_path + "/2D_features.pdf", dpi=300, bbox_inches="tight")
-    plt.savefig(out_path + "/2D_features.svg", dpi=300, bbox_inches="tight")
-    plt.clf()
-    for ft in ["SCI", "z-score of MFE", "Shannon-entropy"]:
-        g = sns.kdeplot(data=df, x=ft, hue="Class")
-        plt.xlim(limit_dict.get(ft))
-        plt.savefig(out_path + "/%s_distribution.svg" % ft.replace(' ','_').replace('-',''), dpi=300, bbox_inches="tight")
-        plt.savefig(out_path + "/%s_distribution.pdf" % ft.replace(' ','_').replace('-',''), dpi=300, bbox_inches="tight")
-        plt.clf()
+    # Create new shuffled sequences
+    shuffled_records = []
+    for i, record in enumerate(alignment):
+        # Build new sequence by taking columns in shuffled order
+        new_seq = ''.join(str(record.seq)[col_idx] for col_idx in column_indices)
         
-    feature_boxplot(df, out_path)
-
-    # pd.plotting.scatter_matrix(df[["SCI", "z-score of MFE", "Shannon-entropy"]], alpha=0.5)
-    sns.pairplot(df[["SCI", "z-score of MFE", "Shannon-entropy", "Class"]], hue="Class")
-    plt.yticks(rotation=90)
-    plt.savefig(out_path +"/scatter_matrix.svg", dpi=300, bbox_inches="tight")
-    plt.savefig(out_path +"/scatter_matrix.pdf", dpi=300, bbox_inches="tight")
-    plt.clf()
-
-    corr = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]].corr()
-    corr.to_csv(out_path +"/pearson_correlation.txt", index=False)
-    print("Pearson correlation matrix of generated features: \n")
-    print(corr)
-
-
-################################################
-#
-#               Data generation
-#
-################################################
-
-
-############################Core function###############################
-"""
-The hub through which all above functions are called. Core function is 
-called by main() once input cmd line is parsed. For options please see
-section 'main function call' below.
-"""
-
-class_dict = {
-    1 : "OTHER",
-    -1: "RNA",
-    0 : "CDS",
-    "OTHER": 1,
-    "ncRNA": -1,
-    "RNA": -1,
-    "CDS": 0,
-    }
-
-
-def create_training_set(filepath, category, options):
+        # Create new SeqRecord with shuffled sequence
+        shuffled_record = SeqRecord(
+            Seq(new_seq),
+            id=record.id,
+            description=record.description
+        )
+        shuffled_records.append(shuffled_record)
     
-    def read_windows(filename):
-        alignments = AlignIO.parse(filename, "clustal")
-        align_dict = {}
-        alignment_count = 0
-        for a in alignments:
-            alignment_count += 1
-            seqs = [str(record.seq) for record in a._records]
-            align_dict[alignment_count] = seqs 
-            
-        return align_dict
+    # Create new alignment with shuffled sequences
+    shuffled_alignment = MultipleSeqAlignment(shuffled_records)
 
-    # Filter sequences by their identity
-    select_seqs(filepath, options.max_id, options.n_seqs)
+    return shuffled_alignment
     
-    # Slice alignments into overlapping alignment windows
-    windows = alignment_windows(filepath, options)
+    
 
-    # Filter alignment windows by structural conservation, using a tree edit distance approximation
-    # At first we need a baseline distribution of tree edit distances using shuffled alignments
-    reference_distances = []
-    edits = []
-    
-    if (category == -1) and options.structure_filter:
-        for window in windows:
-            align_dict = read_windows(window)
-            for (k, seqs) in align_dict.items():
-                shuffled_alignment = shuffle_alignment_columns(seqs)
-                reference_distances.append(calculate_mean_distance([seq for seq in shuffled_alignment]))
-                
-        # We assume that tree edit distances follow an approximately gaussian distribution
-        std = np.std(a=reference_distances)
-        mu = np.mean(a=reference_distances)
-        cutoff = mu - 1.645*std
-    
-        for window in windows:
-            align_dict = read_windows(window)
-            edit_distances = {}
-            for (k, seqs) in align_dict.items():
-                edit_distances[k] = calculate_mean_distance([ungap_sequence(seq) for seq in seqs])
-            if category == -1:
-                filter_windows(window, edit_distances, cutoff=cutoff)
-            edits += list(edit_distances.values())
-        
-        # Plot the density of the control distribution
-        if (category == -1):
-            out_path = options.out_file + "_report"
-            if not os.path.isdir(out_path):
-                os.mkdir(out_path)
-            plot_tree_edit_distribution(reference_distances, edits, out_path)
-        
-    # Calculate feature vectors
-    scis = []
-    zs = []
-    entropies = []
-    hexamers = []
-    tree_edits_ = []
-    codon_c = []
-    
-    for i in range(0, len(windows)):
-        w = windows[i]
-        print("Calculating features:", i, "/", len(windows))
-        sci, zscore, entropy, hex_score, codon_conservation = get_feature_set(w, hexamer_model=options.hexamer_model, tree_path=options.tree_path, stdout=False)
+def shuffle_alignment_file(input_file: str, output_file: str):
+    # Read the alignment
+    alignment = AlignIO.read(input_file, "clustal")
 
-        scis += sci
-        zs += zscore
-        entropies += entropy
-        hexamers += hex_score
-        codon_c += codon_conservation
-    
-    df = pd.DataFrame(data={
-        "SCI": scis,
-        "z-score of MFE": zs,
-        "Shannon-entropy": entropies,
-        "Hexamer Score": hexamers,
-        "Codon conservation": codon_c,
-        "Class": [category]*len(scis)
-        })
+    # Randomize alignment columns
+    shuffled_alignment = shuffle_alignment_columns(alignment)
 
-    return df
-   
-    
-def create_report(df, options):
-    out_path = options.out_file + "_report"
-    if not os.path.isdir(out_path):
-        os.mkdir(out_path)
-    
-    plot_feature_distribution(df, out_path)
-    df.to_csv(out_path +"/feature_vectors.csv", sep="\t")
-
-    
-######################### main function call for 2 classes #################
+    # Write the shuffled alignment
+    AlignIO.write(shuffled_alignment, output_file, "clustal")
+    print(f"Shuffled alignment written to {output_file}")
 
 
-def build_data(options, filename):
-    # Should negative sets be auto-generated for all instances? 
-    if not options.negative and options.generate_control: 
-        print("A negative training set will be auto-generated.")
-        
-    # Core function is called with set options:
-    if not os.path.isdir(filename):
-        filelist = [filename]
-    else:
-        filelist = [os.path.join(filename, f) for f in os.listdir(filename) if os.path.isfile(os.path.join(filename, f))]
-        
-    worktree = {}
-    pos_label = class_dict.get(options.pos_label)
-    if pos_label not in [0, -1]:
-        print("Provided an invalid positive label. Choose from CDS, ncRNA (Default: ncRNA).")
-        sys.exit()
-    
-    # Positive training instance will need to be supplied. Alignment happens now.
-    for entry in filelist:
-        inpath = entry
-        if entry.endswith(".aln"):
-            outpath = inpath
+
+def select_diverse_records(alignment: MultipleSeqAlignment, n_records: int=6, max_identity: float=0.9, max_attempts: int=1000) -> Optional[list[SeqRecord]]:
+    """
+    Select N records from alignment with maximum pairwise identity below threshold.
+
+    Args:
+        alignment: Bio.Align.MultipleSeqAlignment object
+        n_records (int): Number of records to select
+        max_identity (float): Maximum allowed pairwise identity (0.0-1.0)
+        max_attempts (int): Maximum random sampling attempts
+
+    Returns:
+        list: Selected SeqRecord objects, or None if no valid set found
+    """
+    all_records = list(alignment)
+
+    if len(all_records) <= n_records:
+        # If we have fewer records than requested, check if they meet criteria
+        max_id = get_max_identity_in_set(all_records)
+        if max_id <= max_identity:
+            return all_records
         else:
-            outpath = entry.replace(".fasta", ".aln").replace(".fa", ".aln")
-            print("Now aligning: %s" % entry)
-            cline = ClustalwCommandline("clustalw2", infile=inpath, outfile=outpath)
-            cline()
-        worktree[outpath] = pos_label
-    print('End of directory reached. Positive instance data sets found: ' + str(len(worktree)))
-    # If a negative set is supplied it will be scanned now
-    if options.negative:
-        if not os.path.isdir(options.negative):
-            filelist = [options.negative]
-        else:
-            filelist = [f for f in os.listdir(options.negative) if os.path.isfile(os.path.join(options.negative, f))]
-            for entry in filelist:
-                outpath = os.path.join(options.negative, entry + ".aln")
-                inpath = os.path.join(options.negative, entry)
-                if entry.endswith(".aln"):
-                    outpath = inpath
-                else:
-                    print("Now aligning: %s" % entry)
-                    cline = ClustalwCommandline("clustalw2", infile=inpath, outfile=outpath)
-                    cline()
-                worktree[outpath] = 1
+            print(f"Warning: Only {len(all_records)} records available, but max identity ({max_id:.3f}) exceeds threshold ({max_identity})")
+            return all_records  # Return what we have
 
-    # Otherwise, one will be auto-generated using SISSIz
-    if options.generate_control:
-        negativeset = filename+"_negative"
-        dummies = []
-        if not os.path.isdir(negativeset):
-            os.mkdir(negativeset)
-        for (f, c) in worktree.items():
-            outpath = os.path.join(negativeset, os.path.basename(f))
-            generate_control_alignment(inpath=f, outpath=outpath, shuffle=options.shuffle_control)
-            if not is_alignment(outpath):
-                print("Failed to create a valid control alignment for %s." % f)
-                continue
-            dummies.append(outpath)
-        for f in dummies:
-            worktree[f] = 1
-            
-    if len(worktree) == 0:
-        print("You supplied a directory, but I could not find readable fasta-files in it. Could you double-check the format?")
-        sys.exit()
+    # Try random sampling to find a diverse set
+    for attempt in range(max_attempts):
+        selected = random.sample(all_records, n_records)
+        max_id = get_max_identity_in_set(selected)
+
+        if max_id <= max_identity:
+            print(f"Found diverse set after {attempt + 1} attempts (max identity: {max_id:.3f})")
+            return selected
+
+    # If no valid set found, try greedy selection
+    print(f"Random sampling failed after {max_attempts} attempts.")
+    return None
+
+
+
+def select_seqs(input_file, output_file, n_records=6, max_identity=0.95, max_attempts=1000):
+    """
+    Main function to filter alignment by selecting diverse records.
     
-    print("Worktree generated:")
-    vectortable = pd.concat([create_training_set(f, c, options) for (f, c) in list(worktree.items())])
-    vectortable["Class"] = [class_dict.get(a) for a in vectortable["Class"]]
+    Args:
+        input_file (str): Path to input CLUSTAL alignment
+        output_file (str): Path to output CLUSTAL alignment
+        n_records (int): Number of records to select
+        max_identity (float): Maximum pairwise identity threshold
+    """
+    # Read alignment
+    print(f"Reading alignment from {input_file}...")
+    alignment = AlignIO.read(input_file, "clustal")
+    print(f"Original alignment: {len(alignment)} sequences, {alignment.get_alignment_length()} positions")
     
-    create_report(df=vectortable, options=options)
-    if options.out_file.endswith(".tsv"):
-        vectortable.to_csv(options.out_file, sep="\t", index=False)
-        return vectortable, options.out_file
-        
-    vectortable.to_csv(options.out_file+"_trainingdata.tsv", sep="\t", index=False)
-    print("Data generation process exited normally.")
-    return vectortable, options.out_file+"_trainingdata.tsv"
-
-
-######################### main function call for 3 classes #################
-
-
-def build_three_way_data(options):
-    # Core function is called with set options:
-    if not os.path.isdir(options.ncrna) and not os.path.isdir(options.protein):
-        print("Supplied input path is not a directory. --input should point to a directory with fasta files.")
-        sys.exit()
-
-    worktree = {}
+    # Select diverse records
+    selected_records = select_diverse_records(alignment, n_records, max_identity, max_attempts)
     
-    # ncRNA training instance will need to be supplied. Alignment happens now.
-    filelist = [f for f in os.listdir(options.ncrna) if os.path.isfile(os.path.join(options.ncrna, f))]
-    for entry in filelist:
-        outpath = os.path.join(options.ncrna, entry + ".aln")
-        inpath = os.path.join(options.ncrna, entry)
-        print("Now aligning: %s" % entry)
-        cline = ClustalwCommandline("clustalw2", infile=inpath, outfile=outpath)
-        cline()
-        worktree[outpath] = -1
+    if not selected_records:
+        print("Error: No records could be selected")
+        return False
     
-    # protein training instance will need to be supplied. Alignment happens now.
-    filelist = [f for f in os.listdir(options.protein) if os.path.isfile(os.path.join(options.protein, f))]
-    for entry in filelist:
-        outpath = os.path.join(options.protein, entry + ".aln")
-        inpath = os.path.join(options.protein, entry)
-        print("Now aligning: %s" % entry)
-        cline = ClustalwCommandline("clustalw2", infile=inpath, outfile=outpath)
-        cline()
-        worktree[outpath] = 0
+    # Create new alignment with selected records
+    filtered_alignment = MultipleSeqAlignment(selected_records)
     
-    # If a negative set is supplied it will be scanned now
-    if options.negative:
-        filelist = [f for f in os.listdir(options.negative) if os.path.isfile(os.path.join(options.negative, f))]
-        for entry in filelist:
-            outpath = os.path.join(options.negative, entry + ".aln")
-            inpath = os.path.join(options.negative, entry)
-            print("Now aligning: %s" % entry)
-            cline = ClustalwCommandline("clustalw2", infile=inpath, outfile=outpath)
-            cline()
-            worktree[outpath] = 1
-
-    # Otherwise, one will be auto-generated using SISSIz
-    else:
-        negativeset = os.path.split(os.path.abspath(options.ncrna))[0]+"/_negative"
-        dummies = []
-        if not os.path.isdir(negativeset):
-            os.mkdir(negativeset)
-        
-        keys = np.random.choice(list(worktree.keys()), size=int(len(worktree)/2))
-        
-        for (f, c) in [(k, worktree.get(k)) for k in keys]:
-            outpath = os.path.join(negativeset, os.path.basename(f))
-            generate_control_alignment(inpath=f, outpath=outpath)
-            if not is_alignment(outpath):
-                print("Failed to create a valid control alignment for %s." % f)
-                continue
-            dummies.append(outpath)
-        for f in dummies:
-            worktree[f] = 1
-            
-    if len(worktree) == 0:
-        print("You supplied a directory, but I could not find readable fasta-files in it. Could you double-check the format?")
-        sys.exit()
-        
-    vectortable = pd.concat([create_training_set(f, c, options) for (f, c) in list(worktree.items())])
-    print("Data generation process exited normally.")
+    # Write output
+    AlignIO.write(filtered_alignment, output_file, "clustal")
     
-    vectortable.to_csv(options.out_file+"_trainingdata.tsv", sep="\t", index=False)
-    create_report(df=pd.read_csv(options.out_file+"_trainingdata.tsv", sep="\t"), options=options)
-    
-    return vectortable, options.out_file+"_trainingdata.tsv"
+    return True
 
 
 
-################################################
-#
-#               Combination
-#
-################################################
+def slice_alignment_into_windows(input_file: str, window_length: int = 120, step_size: int = 40) -> list[MultipleSeqAlignment]:
+    """
+    Read a CLUSTAL alignment and slice it into overlapping windows.
 
-def combine(options):
-    
-    def has_files(xs):
-        if len(xs) == 0:
-            print("No files to combine. Did you add a wrong prefix? Aborting.")
-            sys.exit()
+    Args:
+        input_file (str): Path to input CLUSTAL alignment file
+        window_length (int): Length of each window
+        step_size (int): Step size between windows
 
-    if os.path.isdir(options.in_file):
-        xs = [os.path.join(options.in_file, x) for x in os.listdir(options.in_file) if x.endswith(".tsv") and x.startswith(options.prefix)]
-        has_files(xs)
-        df = pd.concat([pd.read_csv(x, sep="\t") for x in xs])
+    Returns:
+        List[MultipleSeqAlignment]: List of alignment windows
+    """
+    # Read the alignment
+    alignment = AlignIO.read(input_file, "clustal")
+    alignment_length = alignment.get_alignment_length()
 
-        if options.out_file.endswith(".tsv"):
-            name = options.out_file
-        else:
-            name = options.out_file + ".tsv"
-        
-        df.sort_values(by="Class")
-        df.to_csv(name, sep="\t", index=False)
-        
-    else:
-        xs = [x for x in os.listdir() if x.endswith(".tsv") and x.startswith(options.prefix)]
-        has_files(xs)
-        df = pd.concat([pd.read_csv(x, sep="\t") for x in xs])
+    windows = []
+    start_pos = 0
 
-        if options.out_file.endswith(".tsv"):
-            name = options.out_file
-        else:
-            name = options.out_file + ".tsv"
-        
-        df.sort_values(by="Class")
-        df.to_csv(name, sep="\t", index=False)
+    while start_pos < alignment_length:
+        # Calculate end position for this window
+        end_pos = min(start_pos + window_length, alignment_length)
+
+        # Create new records for this window
+        window_records = []
+        for record in alignment:
+            # Extract the sequence slice for this window
+            window_seq = str(record.seq)[start_pos:end_pos]
+
+            # Create new SeqRecord with the sliced sequence
+            window_record = SeqRecord(
+                Seq(window_seq),
+                id=record.id,
+                description=record.description
+            )
+            window_records.append(window_record)
+
+        # Create MultipleSeqAlignment for this window
+        window_alignment = MultipleSeqAlignment(window_records)
+        windows.append(window_alignment)
+
+        # Move to next window position
+        start_pos += step_size
+
+        # Stop if we've reached the end
+        if end_pos == alignment_length:
+            break
+
+    print(f"Created {len(windows)} windows from alignment of length {alignment_length}")
+    print(f"Window length: {window_length}, Step size: {step_size}")
+
+    return windows
 
 
 
@@ -1445,11 +578,11 @@ def combine(options):
 ################################################
 
 
-def hexamer_permutations():
+def hexamer_permutations() -> list[str]:
     return [str().join(x) for x in product(*(["ATGC"] * 6))]
 
 
-def get_hexamers_from_seq(seq):
+def get_hexamers_from_seq(seq: str) -> list[str]:
     hexamers = []
     i = 0
     while i < len(seq)+6:
@@ -1458,87 +591,86 @@ def get_hexamers_from_seq(seq):
     return hexamers
 
 
-def get_fasta_sequence(filename):
+def get_fasta_sequence(filename: str) -> list[str]:
     handle = SeqIO.parse(handle=open(filename, 'r'), format="fasta")
     records = [str(record.seq) for record in handle]
     return records
-    
 
-def hexamer_model_calibration(options):
+
+def hexamer_model_calibration(options: optparse.Values) -> None:
     coding_file = options.in_coding
     noncoding_file = options.in_noncoding
     outfile = options.out_file
-    
+
     if not outfile.endswith(".tsv"):
         outfile = outfile + ".tsv"
-    
+
     coding_seqs = get_fasta_sequence(coding_file)
     noncoding_seqs = get_fasta_sequence(noncoding_file)
     hex_combinations = hexamer_permutations()
-    
+
     noncoding_dict = {}
     coding_dict = {}
     coding_hexamers, noncoding_hexamers = [], []
     n_seqs_coding = len(coding_seqs)
     n_seqs_noncoding = len(noncoding_seqs)
     count = 0
-    
+
     for seq in coding_seqs:
         count += 1
         print("Screen coding sequences: %s/%s" % (count, n_seqs_coding))
         coding_hexamers += get_hexamers_from_seq(seq)
     count = 0
-    
+
     for seq in noncoding_seqs:
         count += 1
         print("Screen noncoding sequences: %s/%s" % (count, n_seqs_noncoding))
         noncoding_hexamers += get_hexamers_from_seq(seq)
-    
+
     n_coding = len(coding_hexamers)
     n_noncoding = len(noncoding_hexamers)
     count = 0
-    
+
     for hex_ in hex_combinations:
         count += 1
         print("Scan Hexamers: %s/%s" % (count, 4096))
         coding_dict[hex_] = round(coding_hexamers.count(hex_) / n_coding, 8)
         noncoding_dict[hex_] = round(noncoding_hexamers.count(hex_) / n_noncoding, 8)
-        
+
     with open(outfile, "w") as f:
         for hex_ in hex_combinations:
             f.write("%s\t%s\t%s\n" % (hex_, coding_dict.get(hex_), noncoding_dict.get(hex_)))
     print("Hexamer model written to %s." % outfile)
 
 
-################################################
-#
-#               Feature calculation
-#
-################################################
 
+
+################################################
+#
+#               Calculate Features
+#
+################################################
 
 ######################### Misc. ####################################
 
-def ungap_sequence(seq):
+def ungap_sequence(seq: str) -> str:
     return re.sub(r'-', "", seq)
 
 
-def get_GC_content(seq):
+def get_GC_content(seq: str) -> float:
     Gs = seq.count("G")
     Cs = seq.count("C")
-    
     return (Gs + Cs) / len(seq)
 
-
-def average_GC_content(seqs):
+def average_GC_content(seqs: list[str]) -> float:
     return np.mean([get_GC_content(s) for s in seqs])
 
 
-def normalize_seq_length(length, min_len, max_len):
+def normalize_seq_length(length: int, min_len: int, max_len: int) -> float:
     return (length - min_len) / (max_len - min_len)
 
 
-def calculate_sequence_features(seq, GC_content, min_len, max_len):
+def calculate_sequence_features(seq: str, GC_content: float, min_len: int, max_len: int) -> pd.DataFrame:
     length = len(seq)
     Gs, Cs = seq.count("G"), seq.count("C")
     As, Us = seq.count("A"), seq.count("U")
@@ -1557,48 +689,54 @@ def calculate_sequence_features(seq, GC_content, min_len, max_len):
 
 ######################### Shannon entropy ##########################
 
-def log_2(x):
+def log_2(x: float) -> float:
     if x == 0:
         return 0
     return np.log2(x)
 
 
-def column_entropy(dinucleotide, column):
+def column_entropy(dinucleotide: str, column: list[str]) -> float:
     col_string = str().join(column)
     l = len(column)
     f = col_string.count(dinucleotide) / l
     return f *log_2(f)
 
 
-def shannon_entropy(seqs):
+def shannon_entropy(seqs: list[str]) -> float:
     if len(seqs) < 2:
         return 0
     columns = np.asarray([list(seq.strip("\n")) for seq in seqs]).transpose()
     entropy = 0.0
-    
+
     if len(columns) < 4:
         return 0
-    
+
     for column in columns:
         entropy += sum([column_entropy(n, column) for n in nucleotides])
-    
-    return round(entropy *(-1/len(columns)), 4)
+
+    return float(round(entropy *(-1/len(columns)), 4))
 
 
 ########################### Structural conservation index ############
 
-def fold_single(seq):
-    fc = vienna.fold_compound(seq)
-    mfe_structure, mfe = fc.mfe()
+def fold_single(seq: str) -> tuple[str, float]:
+    try:
+        fc = RNA.fold_compound(seq)
+        mfe_structure, mfe = fc.mfe()
+    except Exception:
+        print("\nCould not fold sequence for some reason...")
+        print(f"Offending sequence: {seq}\n")
+        mfe = 0.0
+        mfe_structure = str().join(['.' for i in range(len(seq))])
     return mfe_structure, mfe
 
 
-def call_alifold(seqs):
-    consensus_structure, mfe = vienna.alifold(seqs)
+def call_alifold(seqs: list[str]) -> tuple[str, float]:
+    consensus_structure, mfe = RNA.alifold(seqs)
     return consensus_structure, mfe
 
 
-def structural_conservation_index(seqs):
+def structural_conservation_index(seqs: list[str]) -> float:
     if len(seqs) < 2:
         return 0
     e_consensus = call_alifold(seqs)[1]
@@ -1611,7 +749,7 @@ def structural_conservation_index(seqs):
 
 ########################### z-score of MFE ###########################
 
-def get_bin(GC):
+def get_bin(GC: float) -> str:
     low, high = 0, 0
     for i in range(1, len(bins)):
         lower_bound = bins[i]
@@ -1623,52 +761,66 @@ def get_bin(GC):
     return "%s-%s" % (low, high)
 
 
-def predict_std(seq, GC_bin, feature_vector):
+def predict_std(seq: str, GC_bin: str, feature_vector: list[float]) -> float:
     m = model_std_dict.get(GC_bin)
     return m.predict(feature_vector)[0]
 
 
-def predict_mean(seq, GC_bin, feature_vector):
+def predict_mean(seq: str, GC_bin: str, feature_vector: list[float]) -> float:
     m = model_mean_dict.get(GC_bin)
     return m.predict(feature_vector)[0]
 
 
-def get_distribution(mfes):
+def get_distribution(mfes: list[float]) -> tuple[float, float]:
     std = np.std(mfes)
     mu = np.mean(mfes)
     return mu, std
 
 
-def z_(x, std, mu):
+def z_(x: float, std: float, mu: float) -> float:
     return (x - mu) / std
 
 
-def shuffle_me(seq):
-    generator = DPPermutations(sequence=seq, rng=rng, 
-                sequence_type="RNA", sequence_length=len(seq), di_features=None)
+def random_permutation_generator(seq: str):
+    while True:
+        nucls = list(seq) 
+        random.shuffle(nucls)
+        yield ''.join(nucls)
 
+
+def shuffle_distribution(seq: str) -> list[str]:
     references = []
-    for i in range(0, 100):
-        references.append(generator.shuffle())
+    if "N" in seq:
+        print("SHUFFLE WARNING: Unknown nucleotides 'N' in input sequene...")
+        generator = random_permutation_generator(seq)
+        for i, perm in enumerate(generator):
+            references.append(perm)
+            if i >= 99:
+                break
+    else:
+        for i in range(0, 100):
+            references.append(dinuclShuffle(seq))
     
     return references
 
 
-def z_score_of_mfe(seqs):
+def z_score_of_mfe(seqs: list[str]) -> float:
     if len(seqs) < 2:
         return 0
-    seqs = [ungap_sequence(seq) for seq in seqs]
     zs = []
     distributions = []
-    
     lengths = [len(seq) for seq in seqs]
+
+    # def shuffle_seq(s):
+    #     return s
     
     for seq in seqs:
         GC_content = get_GC_content(seq)
         
         if (GC_content > 0.8) or (GC_content < 0.2):
             print("GC content outside of training range. Shuffling sequence instead...")
-            references = shuffle_me(seq)
+            print(seq)
+            references = shuffle_distribution(seq)
             mfes = [fold_single(s)[1] for s in references]
             mu, std = get_distribution(mfes)
             distributions.append((std, mu))
@@ -1687,32 +839,38 @@ def z_score_of_mfe(seqs):
         std, mu = distributions[i]
         zs.append(z_(fold_single(seq)[1], std, mu))
     
-    return round(np.mean(zs), 4)
+    return float(round(np.mean(zs), 4))
 
 
 ########################### Hexamer Score ###########################
 
 
-def get_background_model(filename):
+def get_background_model(hexamer_model: dict) -> tuple[dict, dict]:
+    return hexamer_model.get("coding"), hexamer_model.get("noncoding")
+
+
+def load_hexamer_model(filename: str) -> dict:
     coding, noncoding = {}, {}
     
     with open(filename, 'r') as f:
         for line in f.readlines():
             hexamer, c, nc = line.split("\t")
             coding[hexamer] = float(c)
-            noncoding[hexamer] = float(nc)
-    
-    return coding, noncoding
+            noncoding[hexamer] = float(nc)  
+    return {
+        "coding": coding,
+        "noncoding": noncoding
+    }
 
 
-def word_generator(seq,word_size,step_size,frame=0):
+def word_generator(seq: str, word_size: int, step_size: int, frame: int = 0):
     for i in range(frame,len(seq),step_size):
         word =  seq[i:i+word_size]
         if len(word) == word_size:
             yield word
 
 
-def kmer_ratio(seq,word_size,step_size, hexamer_model):
+def kmer_ratio(seq: str, word_size: int, step_size: int, hexamer_model: dict) -> list[float]:
     if len(seq) < word_size:
         return 0
     scores = []
@@ -1743,7 +901,7 @@ def kmer_ratio(seq,word_size,step_size, hexamer_model):
     return scores
     
     
-def hexamer_score(seqs, hexamer_model):
+def hexamer_score(seqs: list[str], hexamer_model: dict) -> float:
     if len(seqs) < 2:
         return 0
     
@@ -1776,15 +934,14 @@ def hexamer_score(seqs, hexamer_model):
             score = -1
     
     score = score / len(seqs)
-    return score
+    return round(float(score), 4)
 
 
 ########################## Codon conservation #######################
 
-
 stop_score = 0.0
 framegap_score = -12.0
-blosum_62 = dict(blosum.BLOSUM(62))
+blosum_62 = blosum.BLOSUM(62)
 nucleotides = ["A", 
                "C",
                "G",
@@ -1799,7 +956,7 @@ known_nucs = {
     }
 
 
-def generate_kmers():
+def generate_kmers() -> list[tuple[str, ...]]:
     k = 3
     nucleotides = ['A', 'C', 'G', 'U']
     k_comb = product(nucleotides, repeat=k)
@@ -1808,7 +965,7 @@ def generate_kmers():
 codons = generate_kmers()
 
 
-def maxSubArraySum(arr):
+def maxSubArraySum(arr: list[float]) -> float:
     if len(arr) == 0:
         return 0.0
     size = len(arr)
@@ -1825,7 +982,7 @@ def maxSubArraySum(arr):
     return max_till_now
 
 
-def empirical_substitution_rates(ref_seq, seq):
+def empirical_substitution_rates(ref_seq: str, seq: str) -> dict:
     transitions = {
         "A_A": 0.0, "A_C": 0.0, "A_T": 0.0, "A_G":0.0,
         "C_A": 0.0, "C_C": 0.0, "C_T": 0.0, "C_G":0.0,
@@ -1849,7 +1006,7 @@ def empirical_substitution_rates(ref_seq, seq):
     return transitions
 
 
-def get_stationary_frequencies(seq):
+def get_stationary_frequencies(seq: str) -> dict:
     s = seq.replace("-", "")
     length = len(s)+1
     frequencies = {
@@ -1861,7 +1018,7 @@ def get_stationary_frequencies(seq):
     return frequencies
 
 
-def hamming_distance(codon1, codon2):
+def hamming_distance(codon1: str, codon2: str) -> int:
     d = 3
     for i in range(0, 3):
         if codon1[i] == codon2[i]:
@@ -1869,7 +1026,7 @@ def hamming_distance(codon1, codon2):
     return d
 
 
-def statistical_penalty(codon1, codon2, a_a, frequencies, distance, ref_seq, seq, transitions):
+def statistical_penalty(codon1: str, codon2: str, aa_1: str, aa_2: str, frequencies: dict, distance: int, ref_seq: str, seq: str, transitions: dict) -> float:
     hamming = hamming_distance(codon1, codon2)
     s = 0
     
@@ -1881,18 +1038,21 @@ def statistical_penalty(codon1, codon2, a_a, frequencies, distance, ref_seq, seq
         a2_b2 = transitions.get(codon1[1] + "_" + codon[1], 0)
         a3_b3 = transitions.get(codon1[2] + "_" + codon[2], 0)
         
-        s += blosum_62.get(a_a)*(a1_b1/(distance+1) ) *(a2_b2/(1+distance)) *(a3_b3/(1+distance)) 
+        try:
+            s += blosum_62[aa_1][aa_2]*(a1_b1/(distance+1) ) *(a2_b2/(1+distance)) *(a3_b3/(1+distance)) 
+        except Exception:
+            continue
     return s
 
 
-def gap_score(gap):
+def gap_score(gap: int) -> float:
     if gap == 3:
         return 0.0
     else:
         return -2.0
     
 
-def calculate_offset(seq, index):
+def calculate_offset(seq: str, index: int) -> int:
     nucleotides = []
     old_index = index
     while len(nucleotides) < 3 and index < len(seq):
@@ -1902,7 +1062,7 @@ def calculate_offset(seq, index):
     return index - old_index 
 
 
-def sanitize_alignment(aln):
+def sanitize_alignment(aln: MultipleSeqAlignment) -> MultipleSeqAlignment:
     for record in aln:
         record.id = str(record.id).split(".")[0]
     set_id = set()
@@ -1914,9 +1074,9 @@ def sanitize_alignment(aln):
     return MultipleSeqAlignment(records=aln_)
 
 
-def codon_conservation(alignment, tree_path=None):
-    seqs = [str(record.seq) for record in alignment._records]
-    names = [str(record.id).split(".")[0] for record in alignment._records]
+def codon_conservation(alignment: MultipleSeqAlignment, tree_path: str=None) -> float:
+    seqs = [str(record.seq) for record in alignment]
+    names = [str(record.id).split(".")[0] for record in alignment]
     
     if tree_path:
         tree = Phylo.read(tree_path, "newick")
@@ -1925,20 +1085,20 @@ def codon_conservation(alignment, tree_path=None):
         calculator = DistanceCalculator('identity')
         constructor = DistanceTreeConstructor(calculator, 'nj')
         tree = constructor.build_tree(alignment_)
-        
+
     frames = [0, 1, 2]
     codon_length = 3
-        
     frame_scores = []
     ref_seq = seqs[0]
     frequencies = get_stationary_frequencies(ref_seq)
-    
+
     for frame in frames:
         pair_scores = []
         ref_name = names[0]
         
         for n in range(1, len(seqs)):
             score = 0
+            local_score = 0
             seq = seqs[n]
             name = names[n]
             distance = tree.distance(ref_name, name)
@@ -1955,12 +1115,18 @@ def codon_conservation(alignment, tree_path=None):
                 codon2 = Seq(seq[seq_index] + seq[seq_index+1] + seq[seq_index+2])
     
                 if not "-" in codon2 and not "-" in codon1:
-                    a_a = codon1.translate() + codon2.translate()
-                    if a_a[0] == "*":
+                    aa_1 = codon1.translate() 
+                    aa_2 = codon2.translate()
+                    if aa_1 == "*":
                         local_score = stop_score
                         break
                     else:
-                        local_score = blosum_62.get(a_a) - statistical_penalty(codon1, codon2, a_a, frequencies, distance, ref_seq, seq, transitions)
+                        try:
+                            local_score = blosum_62[aa_1][aa_2] - statistical_penalty(codon1, codon2, aa_1, aa_2, frequencies, distance, ref_seq, seq, transitions)
+                        except Exception:
+                            print(aa_1, aa_2, blosum_62[aa_1][aa_2])
+                            print("Local score error...")
+                            pass
                     
                     codon1_gaps = codon1.count("-")
                     codon2_gaps = codon2.count("-")
@@ -1997,145 +1163,236 @@ def codon_conservation(alignment, tree_path=None):
                 else:
                     ref_index += codon_length
                     seq_index += codon_length
-            
+        
         frame_scores.append(maxSubArraySum(single_scores))
 
     normalized_score = round(max(frame_scores) / len(seqs[0]), 4)
     return normalized_score
 
 
-########################### Feature calculation ##################### 
+def get_feature_set(window: MultipleSeqAlignment, hexamer_model, reverse: bool = False, tree_path: Optional[str] = None, stdout: bool = True, starts: list[int] = [0], ends: list[int] = [0], sequences: list[int] = [0]) -> Optional[dict]:
+    seqs = [str(record.seq).upper().replace("T", "U") for record in window]
+    seqs = [seq for seq in seqs if len(seq) > 0]
 
-def get_genome_coordinates(filename):
+    if len(seqs) < 2:
+        print("Not a valid alignment window - less than 2 non-empty sequences...")
+        return None
+    
+    if reverse:
+        seqs = [get_reverse_complement(seq) for seq in seqs]
+
     try:
-        alignments = AlignIO.parse(filename, "maf")
-        starts = []
-        ends = []
-        strand = []
-        chrs = []
-        
-        for align in alignments:
-            reference = align[0]
-            starts.append(reference.annotations["start"])
-            ends.append(reference.annotations["start"] + reference.annotations["size"])
-            strand.append(reference.annotations["strand"])
-            chrs.append(reference.id.split(".")[1])
-            
-        return starts, ends, strand, chrs
+        sci = structural_conservation_index(seqs)
+        sh_entroy = shannon_entropy(seqs)
+        codon_conserv = codon_conservation(window, tree_path)
 
-    except Exception:
-        return [], [], [], []
+        seqs = [ungap_sequence(seq) for seq in seqs]
+
+        z_score = z_score_of_mfe(seqs) 
+        hexamers = hexamer_score(seqs, hexamer_model)
+    except Exception as e:
+        print("Could not calculate a full feature set. Point of failure:\n")
+        print(e, "\n")
+        return None
+    #print({
+    #    "SCI": sci,
+    #    "z-score of MFE": z_score,
+    #    "Shannon-entropy": sh_entroy,
+    #    "Hexamer Score": hexamers,
+    #    "Codon conservation": codon_conserv,
+    #})
+    return {
+        "SCI": sci,
+        "z-score of MFE": z_score,
+        "Shannon-entropy": sh_entroy,
+        "Hexamer Score": hexamers,
+        "Codon conservation": codon_conserv,
+    }
 
 
-def get_sequence_id(id_, id_set):
-    if id_ in id_set:
-        if len(id_.split(".")) == 1:
-            return id_.split(".")[0] + ".1"
-        count = int(id_.split(".")[1])
-        return id_.split(".")[0] + "." + str(count +1)
-    return id_
+################################################
+#
+#               Data generation
+#
+################################################
 
 
-def parse_windows(filename):
-    try:
-        alignments = AlignIO.parse(filename, "clustal")
-        align_dict = {}
-        alignment_count = 0
-        for a in alignments:
-            id_set = set()
-            seq_count = 0
-            for record in a:
-                seq_count += 1
-                id_ = record.id.split(".")[0]
-                id_set.add(id_)
-                id_updated = get_sequence_id(id_, id_set)
-                id_set.add(id_updated)
-                record.id = id_updated
-            alignment_count += 1
-            align_dict[alignment_count] = a
-        return align_dict
+def init_feature_data() -> dict[str, list]:
+    return  {
+        "SCI": [],
+        "z-score of MFE": [],
+        "Shannon-entropy": [],
+        "Hexamer Score": [],
+        "Codon conservation": [],
+        "Seqs": [],
+        "Class": [],
+        "Name": [],
+    }
+
+def create_training_set(filepath: str, label: str, options: dict) -> pd.DataFrame:
+    path = Path(filepath)
+    sample_path = path.parent / f"{path.stem}_samples"
+    sample_path.mkdir(exist_ok=True)
+    name = str(path.stem)
+
+    hexamer_model = load_hexamer_model(options.hexamer_model)
+
+    # Select X samples of N in [2..12] sequences 
+    for n_seqs in range(2, 12+1, 1):
+        for x in range(1, options.n_samples+1):
+            this_sample_file = sample_path / f"{n_seqs}_seqs_sample_{x}.aln"
+            select_seqs(input_file=filepath, output_file=this_sample_file, n_records=n_seqs, max_identity=options.max_id, max_attempts=options.sampling_attempts)
     
-    except Exception:
-        try:
-            alignments = AlignIO.parse(filename, "maf")
-            align_dict = {}
-            alignment_count = 0
-            for a in alignments:
-                id_set = set()
-                seq_count = 0
-                for record in a:
-                    seq_count += 1
-                    id_ = record.id.split(".")[0]
-                    id_set.add(id_)
-                    id_updated = get_sequence_id(id_, id_set)
-                    id_set.add(id_updated)
-                    record.id = id_updated
-                alignment_count += 1
-                align_dict[alignment_count] = a
-            return align_dict
-        except Exception as e:
-            print("Unknown alignment format found. Neither Clustal nor MAF. Aborting.")
-            raise e
+    # Prepate Filter by tree edit distance  -  if requested
+    print("Now preparing background distribution of tree edit distances... ")
+    if options.structure_filter:
+        reference_distances = []
 
+        # Slice alignments into overlapping windows
+        for f in sample_path.glob("*.aln"):
+            windows = slice_alignment_into_windows(input_file=f, window_length=options.window_length, step_size=options.slide)
 
-def get_reverse_complement(alignment):
-    for record in alignment:
-        record.seq = record.seq.reverse_complement()
-    return alignment
+            for window in windows:
+                shuffled_window = shuffle_alignment_columns(window)
+                reference_distances.append(calculate_mean_distance([ungap_sequence(seq) for seq in shuffled_window]))
 
+        # We assume that tree edit distances follow an approximately gaussian distribution
+        std = np.std(a=reference_distances)
+        mu = np.mean(a=reference_distances)
+        cutoff = mu - 1.645*std
 
-def only_codon_conservation(window):
-    alignment_dict = parse_windows(window)
-    for (k, a) in alignment_dict.items():
-        print(a)
-        print(codon_conservation(a))
-        
+    feature_data = init_feature_data()
 
-def get_feature_set(window, hexamer_model, reverse=False, tree_path=None, stdout=True, starts=[0], ends=[0], sequences=[0]):
-    alignment_dict = parse_windows(window)
-    scis, zs, entropies, hexamers, codon_cons = [], [], [], [], []
-    count = -1
-    
-    def print_output_row(sci, z, entropy, hexamer, conservation, start=0, end=0, direction="forward", sequence=""):
-        if start != 0 and end !=0:
-            print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (sci, z, entropy, hexamer, conservation, start, end, direction, sequence))
+    # Slice alignments into overlapping windows
+    for f in sample_path.glob("*.aln"):
+        # Iff we want structure filtering we now sample each window by it's average tree edit distance vs. the cutoff estimated from the shuffled background distribution
+        if options.structure_filter and (label != 1):
+            windows = []
+            candidates = slice_alignment_into_windows(input_file=f, window_length=options.window_length, step_size=options.slide)
+
+            for candidate in candidates:
+                if calculate_mean_distance([ungap_sequence(seq) for seq in candidate]) > cutoff:
+                    continue
+                windows.append(candidate)
         else:
-            print("%s\t%s\t%s\t%s\t%s\t%s" % (sci, z, entropy, hexamer, conservation, direction, ))
-    
-    for (k, a) in alignment_dict.items():
-        count += 1
-        scis.append(0)
-        entropies.append(0)
-        codon_cons.append(0)
-        zs.append(0)
-        hexamers.append(0)
-        
-        if reverse:
-            direction = "reverse"
-        else:
-            direction = "forward"
-        
-        try:
-            a_ = a
-            if reverse:
-                a_ = get_reverse_complement(a)
-            s = [str(record.seq) for record in a_._records]
-            s = [seq.replace("T", "U") for seq in s]
-            scis[-1] = structural_conservation_index(s)
-            entropies[-1] = shannon_entropy(s)
-            codon_cons[-1] = codon_conservation(a_, tree_path)
-            seqs = [ungap_sequence(seq) for seq in s]
-            zs[-1] = z_score_of_mfe(seqs) 
-            hexamers[-1] = hexamer_score(seqs, hexamer_model)
+            windows = slice_alignment_into_windows(input_file=f, window_length=options.window_length, step_size=options.slide)
+
+        # Calculate feature vectors for each window
+        for window in windows:
+            # Calculate single features
+            features = get_feature_set(window, hexamer_model=hexamer_model, 
+                                       tree_path=options.tree_path, stdout=False)
+            if not features:
+                continue
             
-            if stdout:
-                print_output_row(scis[-1], zs[-1], entropies[-1], hexamers[-1], codon_cons[-1], starts[count], ends[count], direction, sequences[count])
+            for k, v in features.items():
+                feature_data[k].append(v)
+            feature_data["Seqs"].append(len(window))
+            feature_data["Class"].append(class_dict.get(label))
+            feature_data["Name"].append(name)
+
+    for k, v in feature_data.items():
+        print(k, len(v))
+
+    return pd.DataFrame(data=feature_data)
+
+
+def build_data(options: optparse.Values, sissiz_shuffle: bool = False):
+    """
+    Build training data for the classifier.
         
-        except Exception as e:
-            # print(str(e))
-            continue
+    Returns:
+        Dictionary containing the built training data
+    """    
+    worktree = {}
     
-    return scis, zs, entropies, hexamers, codon_cons
+    # ncRNA training data alignment
+    if options.noncoding:
+        path = Path(options.noncoding)
+        
+        for entry in path.glob("*.fa"):
+            entry = str(entry)
+            outpath = entry.replace(".fa", ".aln")
+            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
+            subprocess.call(cline)
+            worktree[outpath] = -1
+    
+    # coding training data alignment
+    if options.coding:
+        path = Path(options.coding)
+        
+        for entry in path.glob("*.fa"):
+            entry = str(entry)
+            outpath = entry.replace(".fa", ".aln")
+            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
+            subprocess.call(cline)
+            worktree[outpath] = 0
+    
+    # If a negative set is supplied it will be scanned now
+    if options.other:
+        path = Path(options.other)
+        
+        for entry in path.glob("*.fa"):
+            entry = str(entry)
+            outpath = entry.replace(".fa", ".aln")
+            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
+            subprocess.call(cline)
+            worktree[outpath] = 1
+
+    # Otherwise, one will be auto-generated using SISSIz
+    else:
+        control_path = Path("Control")
+        control_path.mkdir(exist_ok=True)
+        generated_files = []
+
+        for f, v in worktree.items():
+            outpath = str(control_path / Path(f).name)
+            generate_control_alignment(inpath=f, outpath=outpath, sissiz_shuffle=sissiz_shuffle)
+            if not is_alignment(outpath):
+                print("Failed to create a valid control alignment for %s." % f)
+                continue
+            generated_files.append(outpath)
+        
+        for f in generated_files:
+            worktree[f] = 1
+            
+    if len(worktree) == 0:
+        print("You supplied a directory, but I could not find readable fasta-files in it. Could you double-check the format?")
+        sys.exit()
+
+    def process_single_item(f: str, label: str, options: dict) -> Optional[pd.DataFrame]:
+        """Process a single worktree item and return the feature dataframe"""
+        try:
+            return create_training_set(f, label, options)
+        except Exception as e:
+            print(f"Failed to create feature data for: {f}")
+            return None
+
+    # Initialize the output tsv file
+    feature_df = pd.DataFrame(data=init_feature_data())
+    feature_df.to_csv(options.out_file, sep="\t", index=False)
+
+    # Parallelize the processing
+    results = Parallel(n_jobs=options.threads, backend="threading", verbose=1)(
+        delayed(process_single_item)(f, label, options)
+        for f, label in worktree.items()
+    )
+    # Filter out None results (failed processing)
+    valid_results = [result for result in results if result is not None]
+
+    if valid_results:
+        # Combine all results into a single dataframe
+        combined_df = pd.concat(valid_results, ignore_index=True)
+    
+        # Attach to the initialized output file
+        combined_df.to_csv(options.out_file, sep="\t", index=False, mode='a', header=False)
+    
+        print(f"Successfully processed {len(valid_results)} out of {len(worktree)} items.")
+    else:
+        print("No valid results to write.")
+
+    print("Data generation process exited normally.")
+
 
 
 ################################################
@@ -2145,104 +1402,10 @@ def get_feature_set(window, hexamer_model, reverse=False, tree_path=None, stdout
 ################################################
 
 
-################### Core #################################################
-
-def unpack_features(df, structure):
-    print(structure)
-    
-    if structure:
-        y = df["Class"].ravel()
-        x = df[["SCI", "z-score of MFE", "Shannon-entropy",]]
-        return x, y
-    
-    y = df["Class"].ravel()
-    x = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]
-    return x, y
-
-
-def build_model(options, filename):
-    if os.path.isdir(filename):
-        df = pd.read_csv(filename+"/feature_vectors.csv", sep="\t")
-    else:
-        df = pd.read_csv(filename, sep="\t")
-        
-    if not os.path.isdir(options.out_file):
-        os.mkdir(options.out_file)
-    
-    df["Class"] = [class_dict.get(a) for a in df["Class"]]
-    x, y = unpack_features(df, options.structure)
-    
-    if options.ml == "SVM":
-        parameters = get_svm_hyperparameters(x, y, options)
-        create_sklearn_svm_model(x, y, parameters, filepath=options.out_file)
-
-    elif options.ml == "RF":
-        parameters = get_rf_hyperparameters(x, y, options)
-        create_sklearn_rf_model(x, y, parameters, filepath=options.out_file)
-        
-    elif options.ml == "LR":
-        parameters = get_lr_hyperparameters(x, y, options)
-        create_sklearn_lr_model(x, y, parameters, filepath=options.out_file)
-    
-    
-
-###################### Plotting of Eval ####################################
-
-def draw_roc(fpr, tpr, auc, color="royalblue", name=""):
-    data = {
-        "fpr": fpr,
-        "tpr": tpr,
-        }
-
-    sns.set_style("ticks")
-    textstr = " Area under curve: \n %s" % round(auc, 2)
-    props = dict(boxstyle='round', facecolor='white', alpha=0.5)
-    
-    g = sns.lineplot(data=data, x="fpr", y="tpr", color=color)
-    g.text(0.6, 0.2, textstr, transform=g.transAxes, fontsize=11,
-        verticalalignment='top', bbox=props)
-    
-    plt.xlabel("False positive rate")
-    plt.ylabel("True positive rate")
-    plt.xlim((-0.1, 1.0))
-    plt.ylim((0.0, 1.1))
-    plt.savefig(name + ".pdf", dpi=300, bbox_inches="tight")
-    plt.savefig(name + ".svg", dpi=300, bbox_inches="tight")
-    plt.show()
-
-
-def draw_CV_rocs(x, y, m, outpath):
-    if len(set(y)) > 2:
-        print("No ROC curves for a 3-class problem. Skipping...")
-        return None
-    
-    fs, ts, iis = [], [], []
-    
-    for i in range(1, 5+1):
-        X_train, X_test, y_train, y_test = train_test_split(x, y, test_size=0.33)
-        m.fit(X_train, y_train)
-        y_pred = m.predict(X_test)
-        fpr, tpr, _ = roc_curve(y_pred, y_test)
-        fs += list(fpr)
-        ts += list(tpr)
-        iis += [i]*len(fpr)
-    
-    data = {
-        "fpr": fs,
-        "tpr": ts,
-        "iteration": iis,
-        }
-    
-    sns.lineplot(data=data, x="fpr", y="tpr", hue="iteration")
-    plt.title("Cross-validation of generated model")
-    plt.savefig(outpath+"/crossvalidation_rocs.pdf", dpi=220, bbox_inches="tight")
-    plt.savefig(outpath+"/crossvalidation_rocs.svg", dpi=220, bbox_inches="tight")
-
-
 ###################### Parameter Optimization ###############################
 
 
-def get_rf_hyperparameters(x, y, options):
+def get_rf_hyperparameters(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
     parameters = {
         "n_estimators": 100,
         "min_samples_split": 2,
@@ -2253,11 +1416,13 @@ def get_rf_hyperparameters(x, y, options):
         cv_results.sort_values(by="rank_test_score", ascending=True, inplace=True)
         for ft in ["param_n_estimators", "param_min_samples_split", "param_min_samples_leaf"]:
             parameters[ft.replace("param_", "")] = cv_results[ft].iloc[0]
+
+        cv_results.to_csv(f"{options.out_file}_rf_hyperparameters.tsv", index=False, sep="\t")
             
     return parameters
 
 
-def get_svm_hyperparameters(x, y, options):
+def get_svm_hyperparameters(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
     parameters = {
             "cost": 2.0,
             "gamma": 1.0,
@@ -2267,11 +1432,13 @@ def get_svm_hyperparameters(x, y, options):
         cv_results.sort_values(by="rank_test_score", ascending=True, inplace=True)
         parameters["cost"] = cv_results["param_C"].iloc[0]
         parameters["gamma"] = cv_results["param_gamma"].iloc[0]
+
+        cv_results.to_csv(f"{options.out_file}_svm_hyperparameters.tsv", index=False, sep="\t")
                 
     return parameters
 
 
-def get_lr_hyperparameters(x, y, options):
+def get_lr_hyperparameters(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
     parameters = {
             "cost": 2.0,
             "tolerance": 1.0,
@@ -2282,10 +1449,12 @@ def get_lr_hyperparameters(x, y, options):
         parameters["cost"] = cv_results["param_C"].iloc[0]
         parameters["tolerance"] = cv_results["param_tol"].iloc[0]
 
+        cv_results.to_csv(f"{options.out_file}_lr_hyperparameters.tsv", index=False, sep="\t")
+
     return parameters
 
 
-def rf_hyperparameter_search(x, y, options):
+def rf_hyperparameter_search(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
     m = RandomForestClassifier()
     
     stepsize_estimators = int(round( (options.high_estimators - options.low_estimators) / options.grid_steps , 0))
@@ -2297,25 +1466,29 @@ def rf_hyperparameter_search(x, y, options):
             "min_samples_split": range(options.low_split, options.high_split, stepsize_split),
             "min_samples_leaf": range(options.low_leaf, options.high_leaf, stepsize_leaf),
             }
-    if options.optimizer == "gridsearch":
-        searcher = GridSearchCV(m, 
-                                parameter_grid, 
-                                n_jobs=-1, cv=5)
-        searcher.fit(x, y)
-        
-    elif options.optimizer == "randomwalk":
-        searcher = RandomizedSearchCV(m, 
-                                      parameter_grid, 
-                                      n_jobs=-1, 
-                                      cv=5,
-                                      n_iter=50)
-        searcher.fit(x, y)
     
+    with parallel_backend('threading', n_jobs=options.threads):
+        if options.optimizer == "gridsearch":
+            searcher = GridSearchCV(m, 
+                                    parameter_grid, 
+                                    n_jobs=-1, cv=5,
+                                    verbose=2)
+            searcher.fit(x, y)
+            
+        elif options.optimizer == "randomwalk":
+            searcher = RandomizedSearchCV(m, 
+                                        parameter_grid, 
+                                        n_jobs=-1, 
+                                        cv=5,
+                                        n_iter=50,
+                                        verbose=2)
+            searcher.fit(x, y)
+        
     return pd.DataFrame(data=searcher.cv_results_)
 
 
-def svm_hyperparameter_search(x, y, options):
-    m = svm.SVC(verbose=1)
+def svm_hyperparameter_search(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
+    m = svm.SVC(verbose=1, probability=True)
     
     if options.logscale:
         parameter_grid = {
@@ -2331,24 +1504,25 @@ def svm_hyperparameter_search(x, y, options):
             "gamma": np.arange(start=options.low_g, stop=options.high_g, step=stepsize_g),
             }
     
-    if options.optimizer == "gridsearch":
-        searcher = GridSearchCV(m, 
-                                parameter_grid, 
-                                n_jobs=-1, cv=5)
-        searcher.fit(x, y)
-        
-    elif options.optimizer == "randomwalk":
-        searcher = RandomizedSearchCV(m, 
-                                      parameter_grid, 
-                                      n_jobs=-1, 
-                                      cv=5,
-                                      n_iter=0.25*(len(parameter_grid.get("C")) *len(parameter_grid.get("gamma")) ))
-        searcher.fit(x, y)
+    with parallel_backend('threading', n_jobs=options.threads):
+        if options.optimizer == "gridsearch":
+            searcher = GridSearchCV(m, 
+                                    parameter_grid, 
+                                    n_jobs=-1, cv=5)
+            searcher.fit(x, y)
+            
+        elif options.optimizer == "randomwalk":
+            searcher = RandomizedSearchCV(m, 
+                                        parameter_grid, 
+                                        n_jobs=-1, 
+                                        cv=5,
+                                        n_iter=0.25*(len(parameter_grid.get("C")) *len(parameter_grid.get("gamma")) ))
+            searcher.fit(x, y)
 
     return pd.DataFrame(data=searcher.cv_results_)
 
 
-def lr_hyperparameter_search(x, y, options):
+def lr_hyperparameter_search(x: np.typing.NDArray[np.float64], y: np.typing.NDArray[np.float64], options: optparse.Values) -> dict[str, int]:
     m = LogisticRegression()
     
     if options.logscale:
@@ -2365,126 +1539,340 @@ def lr_hyperparameter_search(x, y, options):
             "tol": np.arange(start=options.low_g, stop=options.high_g, step=stepsize_g),
             }
     
-    if options.optimizer == "gridsearch":
-        searcher = GridSearchCV(m, 
-                                parameter_grid, 
-                                n_jobs=-1, cv=5)
-        searcher.fit(x, y)
-        
-    elif options.optimizer == "randomwalk":
-        searcher = RandomizedSearchCV(m, 
-                                      parameter_grid, 
-                                      n_jobs=-1, 
-                                      cv=5,
-                                      n_iter=0.25*(len(parameter_grid.get("C")) *len(parameter_grid.get("tol")) ))
-        searcher.fit(x, y)
+    with parallel_backend('threading', n_jobs=options.threads):
+        if options.optimizer == "gridsearch":
+            searcher = GridSearchCV(m, 
+                                    parameter_grid, 
+                                    n_jobs=-1, cv=5)
+            searcher.fit(x, y)
+            
+        elif options.optimizer == "randomwalk":
+            searcher = RandomizedSearchCV(m, 
+                                        parameter_grid, 
+                                        n_jobs=-1, 
+                                        cv=5,
+                                        n_iter=0.25*(len(parameter_grid.get("C")) *len(parameter_grid.get("tol")) ))
+            searcher.fit(x, y)
 
     return pd.DataFrame(data=searcher.cv_results_)
 
 
 ######################## Create models ##################################
 
-def scale_features(x):
+def scale_features(x: np.typing.NDArray[np.float64], threads: int=DEFAULT_THREADS) -> tuple[np.typing.NDArray[np.float64], MinMaxScaler]:
     scaler = MinMaxScaler()
-    X = scaler.fit_transform(X=x)
+    with parallel_backend('threading', n_jobs=threads):
+        X = scaler.fit_transform(X=x)
     return X, scaler
 
 
-def create_sklearn_svm_model(X, Y, parameters, filepath):
+def create_sklearn_svm_model(X: np.typing.NDArray[np.float64], Y: np.typing.NDArray[np.float64], parameters: dict[str, float], filepath: str, threads: int=DEFAULT_THREADS):
     X, scaler = scale_features(X)
-    
-    m = svm.SVC(C=parameters.get("cost"), gamma=parameters.get("gamma"), verbose=1)
-    m.fit(X, Y)
-    pickle.dump(m, open(filepath + "/svm_classifier.model", "wb"))
-    pickle.dump(scaler, open(filepath + "/svm_classifier.model_scaler", "wb"))
+    m = svm.SVC(C=parameters.get("cost"), gamma=parameters.get("gamma"), 
+                verbose=1, kernel="rbf", probability=True)
+    with parallel_backend('threading', n_jobs=threads):
+        m.fit(X, Y)
+    pickle.dump(m, open(f"{filepath}.model", "wb"))
+    pickle.dump(scaler, open(f"{filepath}.scaler", "wb"))
 
 
-def create_sklearn_rf_model(X, Y, parameters, filepath):
+def create_sklearn_rf_model(X: np.typing.NDArray[np.float64], Y: np.typing.NDArray[np.float64], parameters: dict[str, float], filepath: str, threads: int=DEFAULT_THREADS):
     X, scaler = scale_features(X)
-    
     m = RandomForestClassifier(**parameters)
-    m.fit(X, Y)
-    pickle.dump(m, open(filepath + "/rf_classifier.model", "wb"))
-    pickle.dump(scaler, open(filepath + "/rf_classifier.model_scaler", "wb"))
+    with parallel_backend('threading', n_jobs=threads):
+        m.fit(X, Y)
+    pickle.dump(m, open(f"{filepath}.model", "wb"))
+    pickle.dump(scaler, open(f"{filepath}.scaler", "wb"))
 
 
-def create_sklearn_lr_model(X, Y, parameters, filepath):
+def create_sklearn_lr_model(X: np.typing.NDArray[np.float64], Y: np.typing.NDArray[np.float64], parameters: dict[str, float], filepath: str, threads: int=DEFAULT_THREADS):
     X, scaler = scale_features(X)
-    
     m = LogisticRegression(C=parameters.get("cost"), tol=parameters.get("tolerance"))
-    m.fit(X, Y)
-    pickle.dump(m, open(filepath + "/lr_classifier.model", "wb"))
-    pickle.dump(scaler, open(filepath + "/lr_classifier.model_scaler", "wb"))
+    with parallel_backend('threading', n_jobs=threads):
+        m.fit(X, Y)
+    pickle.dump(m, open(f"{filepath}.model", "wb"))
+    pickle.dump(scaler, open(f"{filepath}.scaler", "wb"))
 
     
 
-########### Model evaluation ##########################################
+################### Model Core #################################################
+
+def unpack_features(df: pd.DataFrame) -> tuple[np.typing.NDArray[np.float64], np.typing.NDArray[np.float64]]:
+    if "coding" in df["Class"].unique():
+        x = df[["SCI", "z-score of MFE", "Shannon-entropy",]].to_numpy()
+    else:    
+        x = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]].to_numpy()
+
+    y = df["Class"].to_numpy()
+    return x, y
 
 
-def test_model(options):
-    if options.out_file: 
-        out_folder = options.out_file
-    else:
-        out_folder = os.path.basename(options.model_path).replace(".model", "") + "_evaluation_out"
-    
-    if not os.path.isdir(out_folder):
-        os.mkdir(out_folder)
-
-    filename = options.in_file
+def build_model(options: optparse.Values, filename: str) -> None:
     df = pd.read_csv(filename, sep="\t")
+    
+    df["Label"] = [class_dict.get(a) for a in df["Class"]]
     x, y = unpack_features(df)
-    y_pred, y_real = evaluate_classifier(x, y, options.model_path, out_folder)
     
-    df["Assigned class label"] = [class_dict.get(a) for a in y_pred]
-    df["True class label"] = [class_dict.get(a) for a in y_real]
-    df.to_csv("%s/class_labels.tsv" % out_folder, sep="\t", index=False)
+    if options.model == "SVM":
+        parameters = get_svm_hyperparameters(x, y, options)
+        create_sklearn_svm_model(x, y, parameters, filepath=options.out_file, threads=options.threads)
 
-
-def predict_with_sklearn_model(x, y, modelpath):
-    model = pickle.load(open(modelpath, 'rb'))
-    scaler = pickle.load(open(modelpath + "_scaler", 'rb'))
-    x = scaler.transform(x)
-    y_pred = model.predict(x)
-    
-    if type(y_pred[0]) != int and type(y_pred[0]) != float: 
-        y_pred = [class_dict.get(y_pred[i]) for i in range(0, len(y_pred))]
-    
-    return y_pred
-
-
-def evaluate_classifier(x, y, modelpath, outpath):
-    try:
-        y_pred = predict_with_sklearn_model(x, y, modelpath)
-        color = "green"
-    except Exception as e:
-        print("This appears to be an invalid model file. Aborted.")
-        raise e
+    elif options.model == "RF":
+        parameters = get_rf_hyperparameters(x, y, options)
+        create_sklearn_rf_model(x, y, parameters, filepath=options.out_file, threads=options.threads)
         
-    y_pred = [class_dict.get(x) for x in y_pred]
-    y = [class_dict.get(x) for x in y]
-    pos_label = min(y)
+    elif options.model == "LR":
+        parameters = get_lr_hyperparameters(x, y, options)
+        create_sklearn_lr_model(x, y, parameters, filepath=options.out_file, threads=options.threads)
+
+
+
+################################################
+#
+#               Windows
+#
+################################################
+
+
+def slice_alignment_windows(
+    alignment: MultipleSeqAlignment,
+    L: int = 120,
+    W: int = 40,
+    min_identity: float = 0.5,
+    max_identity: float = 0.95,
+    N: int = 6,
+    O: float = 0.8,
+    G: float = 0.75
+) -> list[MultipleSeqAlignment]:
+    """
+    Slice a MultipleSeqAlignment into overlapping windows with filtering.
+
+    Parameters:
+    - alignment: Input MultipleSeqAlignment object
+    - L: Window length (default: 120)
+    - W: Step size (default: 40)
+    - min_identity: Minimum pairwise identity threshold (default: 0.5)
+    - max_identity: Maximum pairwise identity threshold (default: 0.95)
+    - N: Maximum number of sequences per window (default: 6)
+    - O: Target identity for greedy selection (default: 0.8)
+    - G: Maximum gap fraction for reference sequence (default: 0.75)
+
+    Returns:
+    - List of MultipleSeqAlignment objects representing windows
+    """
+    def calculate_pairwise_identity(seq1: str, seq2: str) -> float:
+        """Calculate pairwise identity between two sequences, ignoring gaps."""
+        valid_positions = [(c1, c2) for c1, c2 in zip(seq1, seq2) if c1 != '-' and c2 != '-']
+        if not valid_positions:
+            return 0.0
+        matches = sum(1 for c1, c2 in valid_positions if c1 == c2)
+        return matches / len(valid_positions)
+
+    def get_ungapped_coordinates(sequence: str, start_pos: int, end_pos: int) -> tuple:
+        """Get actual sequence coordinates accounting for gaps."""
+        ungapped_start = 0
+        ungapped_end = 0
+        ungapped_pos = 0
+
+        for i, char in enumerate(sequence):
+            if char != '-':
+                if i == start_pos:
+                    ungapped_start = ungapped_pos
+                if i == end_pos - 1:
+                    ungapped_end = ungapped_pos + 1
+                    break
+                ungapped_pos += 1
+        else:
+            # Handle case where end_pos is at the very end
+            ungapped_end = ungapped_pos
+
+        return ungapped_start, ungapped_end
+
+    def has_annotations(record: SeqRecord) -> bool:
+        """Check if record has MAF-style annotations."""
+        return (hasattr(record, 'annotations') and
+                'start' in record.annotations and
+                'size' in record.annotations and
+                'strand' in record.annotations)
     
-    tpr, fpr, _ = roc_curve(y_pred, y, pos_label=pos_label)
-    auc = roc_auc_score(y_pred, y)
+    def remove_consensus_gaps(sequences: list[str]) -> list[str]:
+        """Remove columns that are all gaps."""
+        if not sequences:
+            return sequences
+        
+        # Find columns that are not all gaps
+        non_gap_columns = []
+        for col_idx in range(len(sequences[0])):
+            column = [seq[col_idx] for seq in sequences]
+            if not all(char == '-' for char in column):
+                non_gap_columns.append(col_idx)
+        
+        # Extract non-gap columns
+        filtered_sequences = []
+        for seq in sequences:
+            filtered_seq = ''.join(seq[col_idx] for col_idx in non_gap_columns)
+            filtered_sequences.append(filtered_seq)
+        
+        return filtered_sequences
     
-    f1 = f1_score(y, y_pred, pos_label=pos_label)
-    acc = accuracy_score(y, y_pred,)
-    recall = recall_score(y, y_pred, pos_label=pos_label)
-    prec = precision_score(y, y_pred, pos_label=pos_label)
+    def calculate_gap_fraction(sequence: str) -> float:
+        """Calculate the fraction of gaps in a sequence."""
+        if not sequence:
+            return 0.0
+        return sequence.count('-') / len(sequence)
+
+    if len(alignment) == 0:
+        return []
+
+    alignment_length = alignment.get_alignment_length()
     
-    result_data = {
-            "Accuracy": [acc],
-            "F1-Score": [f1],
-            "Precision": [prec],
-            "Recall": [recall],
-             "AUC": [auc],
-        }
-    df = pd.DataFrame(result_data)
-    df.to_json(outpath + "/statistical_evaluation.json")
-    print(df)
-    draw_roc(fpr, tpr, auc, color, outpath +"/roc_curve")
+    # Drop alignments shorter than target window size
+    if alignment_length < L:
+        return []
     
-    return y_pred, y
+    reference_seq = str(alignment[0].seq)
+    windows = []
+
+    # Generate windows
+    for start in range(0, alignment_length - L + 1, W):
+        end = start + L
+
+        # Extract window sequences
+        window_records = []
+        for record in alignment:
+            window_seq = str(record.seq)[start:end]
+            window_records.append((record, window_seq))
+
+        # Check reference gap fraction
+        reference_window = window_records[0][1]
+        if calculate_gap_fraction(reference_window) > G:
+            continue
+        
+        # Filter by pairwise identity to reference
+        filtered_records = [window_records[0]]  # Always include reference
+
+        for record, window_seq in window_records[1:]:
+            identity = calculate_pairwise_identity(reference_window, window_seq)
+            if min_identity <= identity <= max_identity:
+                filtered_records.append((record, window_seq))
+
+        # Skip if less than 2 sequences
+        if len(filtered_records) < 2:
+            continue
+
+        # Greedy selection based on target identity O
+        if len(filtered_records) > N:
+            # Keep reference, select others greedily
+            selected = [filtered_records[0]]
+            candidates = filtered_records[1:]
+
+            # Sort by distance to target identity O
+            candidates.sort(key=lambda x: abs(calculate_pairwise_identity(reference_window, x[1]) - O))
+            selected.extend(candidates[:N-1])
+            filtered_records = selected
+
+        # Create new alignment window
+        new_records = []
+        for record, window_seq in filtered_records:
+            # Handle annotations or add coordinates
+            if has_annotations(record):
+                # Update MAF annotations
+                ungapped_start, ungapped_end = get_ungapped_coordinates(str(record.seq), start, end)
+
+                new_record = SeqRecord(
+                    Seq(window_seq),
+                    id=record.id,
+                    description=record.description
+                )
+
+                # Update annotations
+                new_record.annotations = record.annotations.copy()
+                original_start = record.annotations.get('start', 0)
+                strand = record.annotations.get('strand', 1)
+
+                if strand == 1:
+                    new_record.annotations['start'] = original_start + ungapped_start
+                else:
+                    # For negative strand, coordinates are more complex
+                    original_size = record.annotations.get('size', len(str(record.seq).replace('-', '')))
+                    new_record.annotations['start'] = original_start + (original_size - ungapped_end)
+
+                new_record.annotations['size'] = ungapped_end - ungapped_start
+
+            else:
+                # Add coordinates to identifier
+                ungapped_start, ungapped_end = get_ungapped_coordinates(str(record.seq), start, end)
+                new_id = f"{record.id}/{ungapped_start}-{ungapped_end}"
+
+                new_record = SeqRecord(
+                    Seq(window_seq),
+                    id=new_id,
+                    description=record.description
+                )
+
+            new_records.append(new_record)
+
+        # Create new MultipleSeqAlignment
+        if len(new_record):
+            window_alignment = MultipleSeqAlignment(new_records)
+            windows.append(window_alignment)
+
+    return windows
+
+
+def process_windows(options: optparse.Values):
+    """
+    Slice a MultipleSeqAlignment into overlapping windows with filtering.
+
+    Parameters (as passed on to the slice_alignment_windows function):
+    - alignment: Input MultipleSeqAlignment object
+    - L: Window length (default: 120)
+    - W: Step size (default: 40)
+    - min_identity: Minimum pairwise identity threshold (default: 0.5)
+    - max_identity: Maximum pairwise identity threshold (default: 0.95)
+    - N: Maximum number of sequences per window (default: 6)
+    - O: Target identity for greedy selection (default: 0.8)
+    - G: Maximum gap fraction for reference sequence (default: 0.75)
+
+    Returns:
+        None, result is written to output file.
+    """
+    in_file = options.in_file
+    out_file = options.out_file
+    file_handle = open(in_file, 'r')
+
+    # Loading a MAF or a clustal alignment?
+    if in_file.endswith(".maf"):
+        handle = AlignIO.parse(handle=file_handle, format="maf")
+        is_maf = True
+    else:
+        try:
+            handle = AlignIO.parse(handle=file_handle, format="clustal")
+            is_maf = False
+        except Exception:
+            print("Is this supposed to be a MAF alignment? If yes, it should have the .maf file ending.")
+
+    for alignment in handle:
+        windows = slice_alignment_windows(
+            alignment=alignment,
+            L=options.length,
+            W=options.slide,
+            min_identity=options.min_id,
+            max_identity=options.max_id,
+            N=options.n_seqs,
+            O=options.opt_id,
+            G=options.max_gaps,
+        )
+        if is_maf:
+            outfmt = "maf"
+        else:
+            outfmt = "clustal"
+
+        if len(windows) > 0:
+            AlignIO.write(windows, handle=open(out_file, 'a'), format=outfmt)
+            print(f"{len(windows)} windows written to {out_file}.")
+
+    print("Process finished.")
 
 
 ################################################
@@ -2494,381 +1882,383 @@ def evaluate_classifier(x, y, modelpath, outpath):
 ################################################
 
 
-def load_target_model(filename):
+def load_model(filename: str):
+    model = pickle.load(open(filename, 'rb'))
+    scaler = None
+    try: 
+        scaler = pickle.load(open(filename.replace("model", "scaler"), 'rb'))
+    except Exception:
+        print("Could not load corresponding scaler.")
+
+    return model, scaler
+
+
+def init_result_dict() -> dict[str, list]:
+    return {
+        "Name": [],
+        "SCI": [],
+        "z-score of MFE": [],
+        "Shannon-entropy": [],
+        "Hexamer Score": [],
+        "Codon conservation": [],
+        "seqs": [],
+        "strand": [],
+        "prediction": [],
+        "probability": [],
+    }
+
+
+def process_single_window(window: str, hexamer_model, options: optparse.Values, reverse: bool=False) -> Optional[pd.DataFrame]:
+    """Process a window and return the feature dataframe"""
     try:
-        model = pickle.load(open(filename, 'rb'))
+        return get_feature_set(window, hexamer_model, reverse=reverse, tree_path=options.tree_path)
     except Exception as e:
-        print("Could not load model file. Correct path?")
-        sys.exit()
-    return model
+        print(f"Failed to create feature data.")
+        return None
 
 
-def svhip_prediction(options):
-    model = load_target_model(options.model_path)
-    df = pd.read_csv(options.in_file, sep="\t")
+def process_windows_block(blocks: list[MultipleSeqAlignment], hexamer_model, options: optparse.Values, reverse: bool=False) -> pd.DataFrame:
+    results = Parallel(n_jobs=options.threads, backend="multiprocessing", verbose=1)(
+        delayed(process_single_window)(window, hexamer_model, options, reverse)
+        for window in blocks
+    )
+    return results
+
+
+def predict_and_append_to_result_frame(result_data: dict[str, list], model, scaler, block_to_process: list[MultipleSeqAlignment], feature_dict_list: list[dict], is_maf: bool=False, starts: Optional[list[int]]=None, ends: Optional[list[int]]=None):
+    for window, features in zip(block_to_process, feature_dict_list): 
+        length = len(window)
+        if is_maf: 
+            start = window[0].annotations["start"]
+            end = start + window[0].annotations["size"]
+        ref_name = window[0].id
+
+        if features:
+            vector = np.zeros(shape=(1,5))
+            i = 0
+            for k in ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"):
+                vector[0][i] = features.get(k)
+                i += 1
+            if scaler:
+                vector = scaler.transform(vector)
+
+            if np.isnan(np.sum(vector)):
+                print("Caught NaN value in feature vector...")
+                continue
+            try:
+                y = model.predict(vector)[0]
+                y_prob = round(max(model.predict_proba(vector)[0]), 4)
+            except ValueError:
+                print("Invalid input vector -")
+                continue
+                        
+            for k in ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"):
+                result_data[k].append(features.get(k))
+            result_data["Name"].append(ref_name)
+            result_data["seqs"].append(length)
+            result_data["strand"].append('-')
+            result_data["prediction"].append(y)
+            result_data["probability"].append(y_prob)
+            print(f"Reverse strand prediction: {y} with probability {y_prob}.")
+
+            if is_maf:
+                starts.append(start)
+                ends.append(end)
+
+
+def handle_parallel_window_block(block_to_process: list[MultipleSeqAlignment], options: optparse.Values, model, scaler, hexamer_model, is_maf: bool=False, window_count: int = 0):
+    # Initialite the result frame to append
+    result_data = init_result_dict()
+
+    # Track alignment coordinates (if MAF alignment)
+    starts = []
+    ends = []
+
+    # Calculate feature vectors for all windows on forward strand
+    feature_dict_list = process_windows_block(block_to_process, hexamer_model, options)
+
+    # Process results from forward direction 
+    predict_and_append_to_result_frame(
+        result_data, 
+        model, 
+        scaler, 
+        block_to_process, 
+        feature_dict_list, 
+        is_maf,
+        starts, ends
+    )
+    if options.both_strands:
+        # Calculate feature vectors for reverse strand
+        reverse_feature_dict_list = process_windows_block(block_to_process, hexamer_model, options, reverse=True)
+
+        # Process results for reverse strand
+        predict_and_append_to_result_frame(
+            result_data, 
+            model, 
+            scaler, 
+            block_to_process, 
+            reverse_feature_dict_list, 
+            is_maf,
+            starts, ends
+        )
+
+    # Continously append the result data frame to the output file
+    df = pd.DataFrame(data=result_data)
+    if is_maf:
+        df["start"] = starts
+        df["end"] = ends 
+        df = df[["Name", "SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "seqs", "start", "end", "strand", "prediction", "probability"]]
+        starts, ends = [], []
+    df.to_csv(options.out_file, sep="\t", index=False, mode="a", header=None)
+
+
+def svhip_prediction(options: optparse.Values):
+    """
+    Perform RNA prediction using a previously trained model.
     
-    def get_prediction(prob):
-        if prob[1] > 0.5:
-            return "RNA"
+    This function loads pre-trained machine learning models and processes input sequences to predict
+    identity of aligned transcripts or genome regions. 
+    Args:
+        options (optparse.Values): Command-line options object containing:
+            - model_path: Path to the trained prediction model file
+            - hexamer_model: Path to the hexamer scoring model file  
+            - in_file: Path to input file containing sequences to analyze
+            - out_file: Path to output file for results
+    
+    Returns:
+        None: Results are written to the specified output file
+    """    
+    # Load the prediction and hexamer score models from file
+    model, scaler = load_model(options.model_path)
+    hexamer_model = load_hexamer_model(options.hexamer_model)
+
+    file_handle = open(options.in_file, 'r')
+
+    # Loading a MAF or a clustal alignment?
+    if options.in_file.endswith(".maf"):
+        handle = AlignIO.parse(handle=file_handle, format="maf")
+        is_maf = True
+    else:
+        try:
+            handle = AlignIO.parse(handle=file_handle, format="clustal")
+            is_maf = False
+        except Exception:
+            print("Is this supposed to be a MAF alignment? If yes, it should have the .maf file ending.")
+
+    # Initialize the result data frame and outfile
+    result_data = init_result_dict()
+    df = pd.DataFrame(data=result_data)
+
+    # Track alignment coordinates (if MAF alignment)
+    if is_maf:
+        df["start"] = []
+        df["end"] = []
+        df = df[["Name", "SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "seqs", "start", "end", "strand", "prediction", "probability"]]
+    df.to_csv(options.out_file, sep="\t", index=False)
+    window_count = 0
+    block_to_process = []
+
+    for window in handle:
+        print("\n",window)
+        length = len(window)
+
+        if length < 2:
+            continue
+        window_count += 1
+        block_to_process.append(window)
+        # Every N windows, process as a block - this done to (A) facilitate parallelization and (B) to prevent loss of data in case of an Exception / loss of power / whatever
+        if len(block_to_process) % options.n_blocks == 0:
+            handle_parallel_window_block(block_to_process, options, model, scaler, hexamer_model, is_maf, window_count)
+            # result_data = init_result_dict()
+            block_to_process = []
+
+    # Cleanup any leftover from input stream
+    if len(block_to_process) > 0:
+        handle_parallel_window_block(block_to_process, options, model, scaler, hexamer_model, is_maf)
+
+    print(f"Output written to: {options.out_file}")
+
+    if options.bed: 
+        if not is_maf:
+            print("Writing a bed file requires genome coordinates (i.e. a MAF input), though.")
+            return 
+        df = df[["Name", "start", "end", "prediction", "probability", "strand"]]
+        df = df[df["prediction"] != "other"]
+
+        if options.out_file.endswith(".tsv"):
+            bedname = options.out_file.replace(".tsv", ".bed")
         else:
-            return "OTHER"
-    
-    if options.ncrna:
-        target = df[["SCI", "z-score of MFE", "Shannon-entropy"]]
-    else:
-        target = df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]
-    
-    if options.probability:
-        y_prob = model.predict_proba(target)
-        y = [get_prediction(x) for x in y_prob]
-        df["Probability"] = [x[1] for x in y_prob]
-    else:
-        y = model.predict(target)
-        y = [class_dict.get(y_) for y_ in y]
-    predict_column = "Prediction"
-    if options.prediction_label:
-        predict_column = options.prediction_label
-    df[predict_column] = y
-    filename = options.in_file + ".svhip"
-    if options.out_file:
-        filename = options.out_file
-    df.to_csv(filename, sep="\t", index=False)
-    
-    if bool(options.gtf) == True:
-        to_gtf(df, filename)
-            
+            bedname = options.out_file + ".bed"
 
-def print_results(names, alignment_number, classes):
-    if type(classes[0]) != str:
-        classes = [class_dict.get(int(c)) for c in classes]
-    
-    print("\t \t   Alignment \t   Predicted")
-    print("Filename \t | Number \t | Class")
-    print("----------------------------------")
-        
-    for i in range(0, len(names)):
-        print("%s \t | %s \t | %s" % (names[i], alignment_number[i], classes[i]))
-
-
-
-###################################################
-#
-# Testing
-#
-###################################################
-
-def svhip_check():
-    tmp = tempfile.TemporaryFile(mode='w+b', buffering=- 1,)
-    cmd = shlex.split("svhip data --help")
-    returncode = subprocess.call(cmd, stdout=tmp)
-    
-    print("Running system checks...")
-    
-    if returncode == 0:
-        print("TEST 1 / 5: SUCCESS")
-    else:
-        print("FAILED AT: TEST 1 / 5")
-    
-    
-    ###################################################
-    # data generation
-    ###################################################
-    
-    def check_tsv_output(df):
-        if (len(df) >= 20) and ("RNA" in list(df["Class"])) and ("OTHER" in list(df["Class"])) :
-            return True
-        return False
-    
-    
-    cmd = shlex.split("svhip data -i %s/Example/tRNA_test.fasta -o temp.tsv -w 1 -g True " % THIS_DIR)
-    returncode = subprocess.call(cmd, stdout=tmp)
-    df = pd.read_csv("temp.tsv", sep="\t")
-    shutil.rmtree("temp.tsv_report")
-    # shutil.rmtree("Example/tRNA_test.aln_windows")
-    # shutil.rmtree("Example/tRNA_test.fasta_negative")
-    
-    if returncode == 0 and check_tsv_output(df):
-        print("TEST 2 / 5: SUCCESS")
-    else:
-        print("FAILED AT: TEST 2 / 5")
-    
-    
-    ###################################################
-    # model training
-    ###################################################
-    
-    cmd = shlex.split("svhip training -i temp.tsv -o tempmodel")
-    returncode = subprocess.call(cmd, stdout=tmp)
-    
-    if returncode == 0 and os.path.exists("tempmodel/svm_classifier.model"):
-        print("TEST 3 / 5: SUCCESS")
-    else:
-        print("FAILED AT: TEST 3 / 5")
-        
-    
-    ###################################################
-    # feature calculation
-    ###################################################
-    
-    def check_tsv_output_2(df):
-        if (len(df) == 8) :
-            return True
-        return False
-    
-    
-    cmd = shlex.split("svhip features -i %s/Example/Arabidopsis_1.maf -o temp2.tsv -R True " % THIS_DIR)
-    returncode = subprocess.call(cmd, stdout=tmp)
-    df = pd.read_csv("temp2.tsv", sep="\t")
-    
-    if returncode == 0 and check_tsv_output_2(df):
-        print("TEST 4 / 5: SUCCESS")
-    else:
-        print("FAILED AT: TEST 4 / 5")
-    
-    
-    ###################################################
-    # Prediction
-    ###################################################
-    
-    def check_prediction_output(df):
-        if "Prediction" in df.columns:
-            return True
-        return False
-    
-    cmd = shlex.split("svhip predict -i temp2.tsv -M tempmodel/svm_classifier.model -o temp2.tsv --column-label Prediction")
-    returncode = subprocess.call(cmd, stdout=tmp)
-    df = pd.read_csv("temp2.tsv", sep="\t")
-    
-    if returncode == 0 and check_prediction_output(df):
-        print("TEST 5 / 5: SUCCESS")
-    else:
-        print("FAILED AT: TEST 5 / 5")
-    
-    
-    ###################################################
-    # Cleanup
-    ###################################################
-    
-    os.remove("temp.tsv")
-    os.remove("temp2.tsv")
-    shutil.rmtree("tempmodel")
+        df.to_csv(bedname, sep="\t", index=False, header=None)
+        print(f"Bed file written to: {bedname}")
 
 
 
 ################################################
 #
-#               Main function
+#               Core functions
 #
 ################################################
 
 
-def has_input_options(parser, options):
-    for entry in [options.in_file]:
-        if not entry:
-            parser.print_help()
-            print("Input path is missing. Supply it with -i, --input. \n")
-            sys.exit()
+def has_input_options(parser, options) -> bool:
+    if not options.coding and not options.noncoding:
+        return False
+    return True
 
 
-def has_output_options(parser, options):
+def has_output_options(parser, options) -> bool:
     if not options.out_file:
-        parser.print_help()
-        print("Output path is missing. Supply it with -o, --output. \n")
+        return False
+    return True
+
+
+def is_clustalo_available() -> None:
+    if not shutil.which("clustalo"):
+        print("Clustal Omega ('clustalo') command not found. Is it installed in your PATH?")
         sys.exit()
+
+
+def is_sissiz_available() -> bool:
+    if not shutil.which("SISSIz"):
+        print("SISSIz command not found. Is it installed in your PATH?")
+        print("Falling back to manual column shuffling...")
+        return False
+    
+    return True
 
 
 def data(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
+    parser.add_option("--noncoding",action="store",type="string", dest="noncoding",help="Input directory, containing fasta file(s) of noncoding sequences (Requires at least 1 of 'noncoding', 'coding').")
+    parser.add_option("--coding",action="store",type="string", dest="coding",help="Input directory, containing fasta file(s) of coding sequences (Requires at least 1 of 'noncoding', 'coding').")
+    parser.add_option("--other",action="store",type="string", dest="other",help="Input directory, containing fasta file(s) of random (intergenic) sequences (will o auto-generated via randomization of input).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output file (Required).")
     parser.add_option("-N", "--negative",action="store",type="string",dest="negative",help="Should a specific negative data set be supplied for data generation? If this field is EMPTY it will be auto-generated based on the data at hand (This will be the desired option for most uses).")
-    parser.add_option("-d", "--max-id",action="store",type="int",dest="max_id",default=95,help="During data preprocessing, sequences above identity threshold (in percent) will be removed. Default: 95.")
+    parser.add_option("-d", "--max-id",action="store",type="float",dest="max_id",default=0.95,help="During data preprocessing, sequences above identity threshold (in percent) will be removed. Default: 95.")
     parser.add_option("-n", "--num-sequences",action="store",type="int",dest="n_seqs",default=100,help="Number of sequences input alignments will be optimized towards. Default: 100.")
     parser.add_option("-l", "--window-length",action="store",type="int",dest="window_length",default=120,help="Length of overlapping windows that alignments will be sliced into. Default: 120.")
-    parser.add_option("-s", "--slide",action="store",type="int",dest="slide",default=40,help="Controls the step size during alignment slicing and thereby the overlap of each window.")
-    parser.add_option("-w", "--windows",action="store",type="int",dest="n_windows",default=10,help="The number of times the alignment should be fully sliced in windows - for variation.")
-    parser.add_option("-g", "--generate-control", action="store",default=False,dest="generate_control",help="Flag to determine if a negative set should be auto-generated (Default: False).")
-    parser.add_option("-c", "--shuffle-control", action="store", default=True,dest="shuffle_control",help="Use the column-based shuffling approach provided by the RNAz framework instead of SISSIz (Default: False).")
-    parser.add_option("-p", "--positive-label", action="store", default="ncRNA",dest="pos_label",help="The label that should be assigned to the feature vectors generated from the (non-control) input data. Can be CDS (for protein coding sequences) or ncRNA. (Default: ncRNA).")
+    parser.add_option("-w", "--windowslide",action="store",type="int",dest="slide",default=40,help="Controls the step size during alignment slicing and thereby the overlap of each window.")
+    parser.add_option("-s", "--samples",action="store",type="int",dest="n_samples",default=10,help="The number of times samples should be drawn from each input alignment and number of sequences - for variation (Default: 10).")
+    parser.add_option("-a", "--sample-attempts",action="store",type="int",dest="sampling_attempts",default=1000,help="The number of times sampling should be attempted on a given alignment. Mostly a question of computation time (Default: 1000)")
+    # parser.add_option("-g", "--generate-control", action="store",default=True,dest="generate_control",help="Flag to determine if a negative set should be auto-generated (Default: True, if no 'other' data set is supplied).")
+    parser.add_option("-c", "--shuffle-control", action="store_true", default=False, dest="shuffle_control",help="Use a simpler column-based shuffling approach instead of SISSIz (Default: False).")
+    # parser.add_option("-p", "--positive-label", action="store", default="ncRNA",dest="pos_label",help="The label that should be assigned to the feature vectors generated from the (non-control) input data. Can be CDS (for protein coding sequences) or ncRNA. (Default: ncRNA).")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv"),help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
     parser.add_option("-S", "--no-structural-filter", action="store", default=False,dest="structure_filter",help="Set this flag to True if no filtering of alignment windows for statistical significance of structure should occur (Default: False).")
     parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
     options, args = parser.parse_args()
     
-    has_input_options(parser, options)
-    has_output_options(parser, options)
+    if not has_input_options(parser, options):
+        print("Output path is missing. Supply it with -o, --output. \n")
+        sys.exit()
+    if not has_output_options(parser, options):
+        parser.print_help()
+        print("Output path is missing. Supply it with -o, --output. \n")
+        sys.exit()
 
-    filename = options.in_file
-    build_data(options, filename)
-    
-    
-def svhip_combine(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("-p", "--prefix",action="store",type="string",dest="prefix",default="",help="Prefix for selection of files to combine. For example, if set to TEST, only valid feature vector containing files with the prefix TEST will be added.")
-    options, args = parser.parse_args()
-    
-    if not options.in_file:
-        options.in_file = ""
-    
-    has_output_options(parser, options)
-    combine(options)
-    
+    is_clustalo_available()
+
+    if options.shuffle_control:
+        sissiz_shuffle = False
+    else:
+        sissiz_shuffle = is_sissiz_available()
+
+    random.seed(options.seed)
+    build_data(options, sissiz_shuffle)
+
 
 def training(parser):
     # Model training specific options
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("-S", "--structure",action="store",dest="structure",default=False,help="Flag determining if only secondary structure conservation features should be considered. If True, protein coding features will be included (Default: False).")
-    parser.add_option("-M", "--model",action="store",type="string",dest="ml",default="SVM",help="The model type to be trained. You can choose LR (Logistic regression), SVM (Support vector machine) or RF (Random Forest). (Default: SVM)")
-    parser.add_option("--optimize-hyperparameters",action="store",dest="optimize",default=True,help="Select if a parameter optimization should be performed for the ML model. Default is on.")
-    parser.add_option("--optimizer",action="store",type="string",dest="optimizer",default="gridsearch",help="Select the optimizer for hyperparameter search. Search will be conducted with 5-fold crossvalidation and either of 'gridsearch' (default, more precise) or 'randomwalk' (faster).")
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input file generated with 'data' (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Prefix for the model file (Required).")
+    # parser.add_option("-S", "--structure",action="store",dest="structure",default=False,help="Flag determining if only secondary structure conservation features should be considered. If True, protein coding features will be included (Default: False).")
+    parser.add_option("-M", "--model",action="store",type="string",dest="model",default="RF",help="The model type to be trained. You can choose LR (Logistic regression), SVM (Support vector machine) or RF (Random Forest). (Default: RF)")
+    parser.add_option("--optimize-hyperparameters",action="store_true",dest="optimize",default=False,help="Flag: If a parameter optimization should be performed for the ML model. Default is off.")
+    parser.add_option("--optimizer",action="store",type="string",dest="optimizer",default="randomwalk",help="Select the optimizer for hyperparameter search. Search will be conducted with 5-fold crossvalidation and either of 'gridsearch' (exhaustive) or 'randomwalk' (default, faster).")
     
     parser.add_option("--low-c",action="store",type="int",dest="low_c",default=1,help="SVM hyperparameter search: Lowest value of the cost (C) parameter to optimize. Does nothing if no SVM classifier is used.")
-    parser.add_option("--high-c",action="store",type="int",dest="high_c",default=1000,help="SVM hyperparameter search: Highest value of the cost (C) parameter to optimize. Does nothing if no SVM classifier is used.")
+    parser.add_option("--high-c",action="store",type="int",dest="high_c",default=100,help="SVM hyperparameter search: Highest value of the cost (C) parameter to optimize. Does nothing if no SVM classifier is used.")
     parser.add_option("--low-gamma",action="store",type="int",dest="low_g",default=1,help="SVM hyperparameter search: Lowest value of the gamma parameter to optimize. Does nothing if no SVM classifier is used.")
-    parser.add_option("--high-gamma",action="store",type="int",dest="high_g",default=1000,help="SVM hyperparameter search: Highest value of the gamma parameter to optimize. Does nothing if no SVM classifier is used.")
+    parser.add_option("--high-gamma",action="store",type="int",dest="high_g",default=100,help="SVM hyperparameter search: Highest value of the gamma parameter to optimize. Does nothing if no SVM classifier is used.")
     parser.add_option("--hyperparameter-steps",action="store",type="int",dest="grid_steps",default=10,help="Number of values to try out for EACH hyperparameter. Values will be evenly spaced. Default: 10")
-    parser.add_option("--logscale",action="store",dest="logscale",default=False,help="Flag that decides if a logarithmic scale should be used for the hyperparameter grid. If set, a log base can be set with --logbase.")
-    parser.add_option("--logbase",action="store",type="int",dest="logbase",default=2,help="The logarithmic base if a log scale is used in hyperparameter search. Default: 10.")
+    parser.add_option("--logscale",action="store_true",dest="logscale",default=False,help="Flag that decides if a logarithmic scale should be used for the hyperparameter grid. If set, a log base can be set with --logbase.")
+    parser.add_option("--logbase",action="store",type="int",dest="logbase",default=2,help="The logarithmic base if a log scale is used in hyperparameter search. Default: 2.")
     
     # Random Forest specific options 
-    parser.add_option("--min-trees",action="store",type="int",dest="low_estimators",default=1,help="Random Forest hyperparameter search: Minimum number of trees before optimization. Does nothing if no RF classifier is used.")
-    parser.add_option("--max-trees",action="store",type="int",dest="high_estimators",default=1000,help="Random hyperparameter search: Maximum number of trees before optimization. Does nothing if no RF classifier is used.")
+    parser.add_option("--min-trees",action="store",type="int",dest="low_estimators",default=100,help="Random Forest hyperparameter search: Minimum number of trees before optimization. Does nothing if no RF classifier is used (Default: 100).")
+    parser.add_option("--max-trees",action="store",type="int",dest="high_estimators",default=500,help="Random hyperparameter search: Maximum number of trees before optimization. Does nothing if no RF classifier is used (Default: 500).")
     parser.add_option("--min-samples-split",action="store",type="int",dest="low_split",default=2,help="Random Forest hyperparameter search: Minimum number of samples for splitting an internal node in the forest. Does nothing if no RF classifier is used.")
     parser.add_option("--max-samples-split",action="store",type="int",dest="high_split",default=16,help="Random hyperparameter search:  Maximum number of samples for splitting an internal node in the forest. Does nothing if no RF classifier is used.")
     parser.add_option("--min-samples-leaf",action="store",type="int",dest="low_leaf",default=1,help="Random Forest hyperparameter search: Minimum number of samples for splitting a leaf node in the forest. Does nothing if no RF classifier is used.")
     parser.add_option("--max-samples-leaf",action="store",type="int",dest="high_leaf",default=16,help="Random hyperparameter search: Maximum number of samples for splitting a leaf node in the forest. Does nothing if no RF classifier is used.")
     options, args = parser.parse_args()
     
-    has_input_options(parser, options)
-    has_output_options(parser, options)
-    
+    if not options.in_file:
+        print("You did not provide a file with features. Maybe you need to create one with 'svhip.py data'?")
+        sys.exit()
+    if not options.out_file:
+        print("A name prefix for the output model needs to be provided.")
+        sys.exit()
+    if options.model not in ["RF", "SVM", "LR"]:
+        print("Unknown model type. Valid choices are: RF (Random forest), LR (Logistic regression), SVM (Support vector machine).")
+        sys.exit()
+
+    random.seed(options.seed)
     filename = options.in_file
     build_model(options, filename)
 
 
-def data_3(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("-a","--ncRNA",action="store",type="string", dest="ncrna",help="The input directory or file containing ncRNA training examples (Required).")
-    parser.add_option("-b","--protein",action="store",type="string", dest="protein",help="The input directory or file containing protein encoding training examples (Required).")
-    parser.add_option("-N", "--negative",action="store",type="string",dest="negative",help="Should a specific negative data set be supplied for data generation? If this field is EMPTY it will be auto-generated based on the data at hand (This will be the desired option for most uses).  ")
-    parser.add_option("--log-file",action="store",type="string", dest="log_file",help="Name of log file", default="logs.info")   
-    parser.add_option("-d", "--max-id",action="store",type="int",dest="max_id",default=95,help="During data preprocessing, sequences above identity threshold (in percent) will be removed. Default: 95.")
-    parser.add_option("-n", "--num-sequences",action="store",type="int",dest="n_seqs",default=100,help="Number of sequences input alignments will be optimized towards. Default: 100.")
-    parser.add_option("-l", "--window-length",action="store",type="int",dest="window_length",default=120,help="Length of overlapping windows that alignments will be sliced into. Default: 120.")
-    parser.add_option("-s", "--slide",action="store",type="int",dest="slide",default=40,help="Controls the step size during alignment slicing and thereby the overlap of each window.")
-    parser.add_option("-w", "--windows",action="store",type="int",dest="n_windows",default=10,help="The number of times the alignment should be fully sliced in windows - for variation.")
-    parser.add_option("-h", "--hexamer-model", action="store",dest="pos_label",help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv.")
+def svhip_windows(parser):
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input alignment file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output file (Required).")
+    parser.add_option("-l", "--length", action="store", type="int", default=120, dest="length", help="Length of windows to cut into (Default: 120).")
+    parser.add_option("-s", "--slide", action="store", type="int", default=80, dest="slide", help="Slide step size for overlapping windows (Default: 80).")
+    parser.add_option("--min-id", action="store", type="float", default=0.5, dest="min_id", help="Minimum pairwise identity of sequences to keep (Default: 0.5).")
+    parser.add_option("--max-id", action="store", type="float", default=0.95, dest="max_id", help="Maximum pairwise identity of sequences to keep (Default: 0.95).")
+    parser.add_option("--opt-id", action="store", type="float", default=0.8, dest="opt_id", help="Pairwise identity of sequences to optimize for (Default: 0.8)")
+    parser.add_option("-n", "--num-seqs", action="store", type="int", default=6, dest="n_seqs", help="Maximum number of sequences in the alignment window (Default: 6).")
+    parser.add_option("-g", "--max-gaps", action="store", type="float", default=0.75, dest="max_gaps", help="Maximum fraction of gaps in reference sequence (Default: 0.75).")
     options, args = parser.parse_args()
-
-    has_output_options(parser, options)
-
-    if not options.ncrna:
-        parser.print_help()
-        print("No ncRNA data sample. Supply it with -a, --ncRNA. \n")
-        sys.exit()
     
-    if not options.protein:
-        parser.print_help()
-        print("No protein data sample. Supply it with -b, --protein. \n")
+    if not options.in_file:
+        print("Please add an input alignment with -i.")
         sys.exit()
-        
     if not options.out_file:
-        parser.print_help()
-        print("You need to supply a name for the output directory with -o, --outfile.")
+        print("Missing output file argument -o.")
         sys.exit()
-
-    build_three_way_data(options)
-
-
-def evaluate(parser):
-    # Test / prediction specific options
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("--model-path",action="store",type="string",dest="model_path",default="",help="If running a model test (--task test) or prediction (--task predict), this is the path of the model to evaluate. The data set to use should be handed over with -i, --input. ")
-    options, args = parser.parse_args()
-    has_input_options(parser, options)
     
-    test_model(options)
+    random.seed(options.seed)
+    process_windows(options)
 
 
 def predict(parser):
     # Test / prediction specific options
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("-M", "--model-path",action="store",type="string",dest="model_path",default="",help="If running a model test (--task test) or prediction (--task predict), this is the path of the model to evaluate. The data set to use should be handed over with -i, --input. ")
-    parser.add_option("--column-label",action="store",type="string",dest="prediction_label",default="Prediction",help="Column name for the prediction in the output.")
-    parser.add_option("--structure", action="store", dest="ncrna", default=False, help="Set to True if only features for conservation of secondary structure should be used. Depends on type of model.")
-    parser.add_option("--gtf", action="store", dest="gtf", default=False, help="Set to True if you want overlapping annotations to be merged and written as GTF file. IMPORTANT: Requires genomic coordinates in input.")
-    parser.add_option("--probability", action="store", dest="probability", default=False, help="Set to True if you want class probabilities assigned in final output. Warning: Requires model to be trained with probability flag.")
-    options, args = parser.parse_args()
-    has_input_options(parser, options)
-    
-    svhip_prediction(options)
-
-
-def features(parser):
-    
-    def flatten_me(forward, reverse):
-        return [x for xs in zip(forward, reverse) for x in xs]
-    
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output file. Optional here, as features can also be printed to stdout.")
-    parser.add_option("-R","--reverse",action="store", dest="reverse", default=False, help="Also scan the reverse complement when calculating features.")
-    parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=hexamer_backup,help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
+    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input alignment file (Required).")
+    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output file (Required).")
+    parser.add_option("-M", "--model-path",action="store",type="string",dest="model_path",default="",help="The path to the trained model (Required).")
     parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
-    parser.add_option("--stdout", action="store", default=True, dest="stdout", help="Set the --stdout flag to False if you do not want to have output printed to screen as well. This feature is mostly for manual redirection to files.")
-    
+    parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv"),help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
+    parser.add_option("--both-strands", action="store_true", default=False, dest="both_strands", help="Should forward and reverse strands be screened? Default: False.")
+    # parser.add_option("--column-label",action="store",type="string",dest="prediction_label",default="Prediction",help="Column name for the prediction in the output.")
+    # parser.add_option("--structure", action="store", dest="ncrna", default=False, help="Set to True if only features for conservation of secondary structure should be used. Depends on type of model.")
+    parser.add_option("--bed", action="store_true", dest="bed", default=False, help="Set to True if you want overlapping annotations to be merged and written as BED file. IMPORTANT: Requires genomic coordinates in input - i.e. MAF fomat.")
+    parser.add_option("--windows-per-block", action="store", type="int", default=50, dest="n_blocks", help="Define how many windows are processed as a parallelized block and written to output before loading the next block (Default: 50).")
+    # parser.add_option("--probability", action="store", dest="probability", default=False, help="Set to True if you want class probabilities assigned in final output. Warning: Requires model to be trained with probability flag.")
     options, args = parser.parse_args()
-    has_input_options(parser, options)
-    starts, ends, directions, chromosomes = get_genome_coordinates(options.in_file)
     
-    if len(starts) > 0 and len(ends) > 0 and options.stdout==True:
-        print("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "start", "end", "direction", "sequence"))
-    else:
-        print("%s\t%s\t%s\t%s\t%s\t%s" % ("SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation", "direction"))
-    
-    scis, zs, entropies, hexamers, codon_cons = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, tree_path=options.tree_path, stdout=options.stdout, starts=starts, ends=ends, sequences=chromosomes)
-    if options.reverse:
-        scis_reverse, zs_reverse, entropies_reverse, hexamers_reverse, codons_reverse = get_feature_set(options.in_file, hexamer_model=options.hexamer_model, reverse=True, tree_path=options.tree_path, stdout=options.stdout, starts=starts, ends=ends, sequences=chromosomes)
-        df = pd.DataFrame(data={
-            "SCI": flatten_me(scis, scis_reverse),
-            "z-score of MFE": flatten_me(zs, zs_reverse),
-            "Shannon-entropy": flatten_me(entropies, entropies_reverse),
-            "Hexamer Score": flatten_me(hexamers, hexamers_reverse),
-            "Codon conservation": flatten_me(codon_cons, codons_reverse),
-            })
-        if len(starts)*2 == len(df):
-            try:
-                df["start"] = flatten_me(starts, starts)
-                df["end"] = flatten_me(ends, ends)
-                df["direction"] = flatten_me(["forward"]*len(scis), ["reverse"]*len(scis))
-                df["chromosome"] = flatten_me(chromosomes, chromosomes)
-            except Exception as e:
-                print(str(e))
-                pass
-        
-    else:
-        df = pd.DataFrame(data={
-            "SCI": scis,
-            "z-score of MFE": zs,
-            "Shannon-entropy": entropies,
-            "Hexamer Score": hexamers,
-            "Codon conservation": codon_cons,
-            })
-        if len(starts) == len(df):
-            df["start"] = starts
-            df["end"] = ends
-            df["direction"] = ["forward"]*len(df)
-            df["sequence"] = chromosomes
-    if options.out_file:
-        fname = options.out_file
-        if not fname.endswith(".tsv"):
-            fname = fname + ".tsv"
-        df.to_csv(fname, sep="\t", index=False)
-    else:
-        df.to_csv(options.in_file + ".svhip.tsv", sep="\t", index=False)
+    if not options.in_file:
+        print("Please add an input alignment with -i.")
+        sys.exit()
+    if not options.out_file:
+        print("Missing output file argument -o.")
+        sys.exit()
+    if not options.out_file:
+        print("Missing model file argument -M.")
+        sys.exit()
+
+    random.seed(options.seed)
+    svhip_prediction(options)
 
 
 def hexamer_calibrator(parser):
@@ -2879,32 +2269,11 @@ def hexamer_calibrator(parser):
     hexamer_model_calibration(options)
 
 
-def codon_conservation_score(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    options, args = parser.parse_args()
-    has_input_options(parser, options)
-    only_codon_conservation(options.in_file)
-    
-    
-def create_gtf_from_prediction(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    options, args = parser.parse_args()
-    has_input_options(parser, options)
-    df = pd.read_csv(options.in_file, sep="\t")
-    to_gtf(df, options.in_file)
-    
-    
-def mafmerge(parser):
-    parser.add_option("-i","--input",action="store",type="string", dest="in_file",help="The input directory or file (Required).")
-    parser.add_option("-o","--outfile",action="store",type="string", dest="out_file",help="Name for the output directory (Required).")
-    parser.add_option("-l","--length",action="store",type="int", dest="block_length", default=1000,help="Maximum length that resulting MAF alignment blocks will be merged into (Default: 1000 nt).")
-    parser.add_option("-c","--consensus",action="store",type="float", dest="consensus_threshold", default=0.75,help="Defines the fraction up to which aligned species in two neighboring alignment blocks have to be identical for merging (Default: 0.75).")
-    parser.add_option("-d","--distance",action="store",type="int", dest="distance_threshold", default=0,help="Highest allowed distance between genomic coordinates of aligned sequences in neighboring alignment blocks. Species that are further apart, for exaple through genetic inserts, will be removed from merged blocks (Default: 0 nt).")
-    options, args = parser.parse_args()
-    has_input_options(parser, options)
-    has_output_options(parser, options)
-    merge_maf_blocks(options)
+################################################
+#
+#               Main
+#
+################################################
 
 
 def main():
@@ -2913,39 +2282,30 @@ def main():
     # Setup a command line parser, replacing the outdated "currysoup" module
     usage = "\n%prog  [options]"
     parser = OptionParser(usage,version="%prog " + __version__)
+    parser.add_option("--threads",action="store",type="int", dest="threads", default=DEFAULT_THREADS, help="Number of threads to allocate (Default: max(CPU_COUNT-1, 1)).")
+    parser.add_option("--seed",action="store",type="int", dest="seed", default=RANDOM_SEED, help="Integer seed to control certain randomized behavior (in particular sequence and non-SISSIz alignment shuffling). Optional.")
+
     t = time.time()
     
     if len(args) < 2:
-        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'codon_conservation', 'combine', 'hexcalibrate'.")
+        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'train', 'windows', 'predict','hexcalibrate'.")
         sys.exit()
     if args[1] == "data":
         data(parser)
-    elif args[1] == "training":
+    elif args[1] == "train":
         training(parser)
-    elif args[1] == "data3":
-        data_3(parser)
-    elif args[1] == "evaluate":
-        evaluate(parser)
+    elif args[1] == "windows":
+        svhip_windows(parser)
     elif args[1] == "predict":
         predict(parser)
-    elif args[1] == "features":
-        features(parser)
-    elif args[1] == "codon_conservation":
-        codon_conservation_score(parser)
-    elif args[1] == "check":
-        svhip_check()
-    elif args[1] == "combine":
-        svhip_combine(parser)
     elif args[1] == "hexcalibrate":
         hexamer_calibrator(parser)
-    elif args[1] == "index":
-        create_gtf_from_prediction(parser)
-    elif args[1] == "mafmerge":
-        mafmerge(parser)
+    
     else:
-        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'training', 'evaluate', 'features', 'predict', 'codon_conservation', 'combine', 'hexcalibrate', 'index'.")
+        print("Usage: svhip [Task] [Options] with Task being one of 'data', 'train', 'windows', 'predict','hexcalibrate'.")
         sys.exit()
-    # print("Program ran for %s seconds." % round(time.time() - t, 2))
+
+    print("\nProgram ran for %s seconds." % round(time.time() - t, 2))
     
 
 if __name__=='__main__':
