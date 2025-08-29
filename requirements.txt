@@ -1,0 +1,14 @@
+python==3.10
+biopython==1.85
+blosum==2.0.3
+joblib==1.5.1
+numpy==1.24.4
+pandas==2.3.1
+python-dateutil==2.9.0.post0
+pytz==2025.2
+scikit-learn==1.1.3
+scipy==1.15.3
+six==1.17.0
+threadpoolctl==3.6.0
+tzdata==2025.2
+viennarna==2.7.0
