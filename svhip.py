@@ -122,12 +122,18 @@ max_len = 200
 
 def is_fasta(filename: str) -> bool:
     with open(filename, "r") as handle:
-        fasta = SeqIO.parse(handle, "fasta")
-        return any(fasta) 
+        try:
+            fasta = SeqIO.parse(handle, "fasta")
+        except Exception:
+            return False
+    return any(fasta) 
     
     
 def is_alignment(filename: str) -> bool:
-    alignment = AlignIO.read(filename, "clustal")
+    try:
+        alignment = AlignIO.read(filename, "clustal")
+    except Exception:
+        return False
     return any(alignment)
 
 
@@ -1305,38 +1311,35 @@ def build_data(options: optparse.Values, sissiz_shuffle: bool = False):
         Dictionary containing the built training data
     """    
     worktree = {}
+
+    # Helper function to pass alignment to ClustalO - if necessary
+    def handle_clustalo(infile, threads, realign=False):
+        entry = str(infile)
+        outpath = entry.replace(".fa", ".aln")
+        if (not Path(outpath).exists()) or realign:
+            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
+            subprocess.call(cline)
+        return outpath
     
     # ncRNA training data alignment
     if options.noncoding:
         path = Path(options.noncoding)
-        
         for entry in path.glob("*.fa"):
-            entry = str(entry)
-            outpath = entry.replace(".fa", ".aln")
-            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
-            subprocess.call(cline)
+            outpath = handle_clustalo(infile=entry, threads=options.threads, realign=options.realign)
             worktree[outpath] = -1
     
     # coding training data alignment
     if options.coding:
         path = Path(options.coding)
-        
         for entry in path.glob("*.fa"):
-            entry = str(entry)
-            outpath = entry.replace(".fa", ".aln")
-            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
-            subprocess.call(cline)
+            outpath = handle_clustalo(infile=entry, threads=options.threads, realign=options.realign)
             worktree[outpath] = 0
     
     # If a negative set is supplied it will be scanned now
     if options.other:
         path = Path(options.other)
-        
         for entry in path.glob("*.fa"):
-            entry = str(entry)
-            outpath = entry.replace(".fa", ".aln")
-            cline = clustalo_cmdline(infile=entry, outfile=outpath, threads=options.threads)
-            subprocess.call(cline)
+            outpath = handle_clustalo(infile=entry, threads=options.threads, realign=options.realign)
             worktree[outpath] = 1
 
     # Otherwise, one will be auto-generated using SISSIz
@@ -2147,6 +2150,7 @@ def data(parser):
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv"),help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
     parser.add_option("-S", "--no-structural-filter", action="store", default=False,dest="structure_filter",help="Set this flag to True if no filtering of alignment windows for statistical significance of structure should occur (Default: False).")
     parser.add_option("-T", "--tree", action="store", default=None, dest="tree_path", help="If an evolutionary tree of species in the alignment is available in Newick format, you can pass it here. Names have to be identical. If None is passed, one will be estimated based on sequences at hand." )
+    parser.add_option("-f", "--force-realignment", action="store_true", default=False, dest="realign", help="Force realignment of input sequences even if alignments already exist (Default: False).")
     options, args = parser.parse_args()
     
     if not has_input_options(parser, options):
