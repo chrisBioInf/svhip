@@ -1374,27 +1374,51 @@ def build_data(options: optparse.Values, sissiz_shuffle: bool = False):
     # Initialize the output tsv file
     feature_df = pd.DataFrame(data=init_feature_data())
     feature_df.to_csv(options.out_file, sep="\t", index=False)
+    files = []
+    labels = []
+    n_data_points = 0
 
-    # Parallelize the processing
-    results = Parallel(n_jobs=options.threads, backend="threading", verbose=1)(
-        delayed(process_single_item)(f, label, options)
-        for f, label in worktree.items()
-    )
-    # Filter out None results (failed processing)
-    valid_results = [result for result in results if result is not None]
+    # Iterate over items until 
+    for n, (f, label) in enumerate(worktree.items()):
+        files.append(f)
+        labels.append(label)
 
-    if valid_results:
-        # Combine all results into a single dataframe
-        combined_df = pd.concat(valid_results, ignore_index=True)
+        if n+1 % options.threads == 0:
+            # Parallelize the feature calculation
+            results = Parallel(n_jobs=options.threads, backend="threading", verbose=1)(
+                delayed(process_single_item)(f, label, options)
+                for f, label in zip(files, labels)
+            )
+            # Filter out None results (failed processing)
+            valid_results = [result for result in results if result is not None]
+            files = []
+            labels = []
+
+            if valid_results:
+                # Combine all results into a single dataframe
+                combined_df = pd.concat(valid_results, ignore_index=True)
+                n_data_points += len(combined_df)
+            
+                # Attach to the initialized output file
+                combined_df.to_csv(options.out_file, sep="\t", index=False, mode='a', header=False)
+            
+                print(f"Successfully processed {len(valid_results)} out of {len(worktree)} items.")
+            else:
+                print("No valid results to write.")
     
-        # Attach to the initialized output file
-        combined_df.to_csv(options.out_file, sep="\t", index=False, mode='a', header=False)
-    
-        print(f"Successfully processed {len(valid_results)} out of {len(worktree)} items.")
-    else:
-        print("No valid results to write.")
+    # Process the leftovers
+    if len(files) > 0:
+        results = Parallel(n_jobs=options.threads, backend="threading", verbose=1)(
+                delayed(process_single_item)(f, label, options)
+                for f, label in zip(files, labels)
+            )
+        valid_results = [result for result in results if result is not None]
+        if valid_results:
+                combined_df = pd.concat(valid_results, ignore_index=True)
+                combined_df.to_csv(options.out_file, sep="\t", index=False, mode='a', header=False)
+                n_data_points += len(combined_df)
 
-    print("Data generation process exited normally.")
+    print(f"Data generation process exited normally. {n_data_points} data points written to {options.out_file}.")
 
 
 
