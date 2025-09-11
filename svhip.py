@@ -1235,7 +1235,7 @@ def init_feature_data() -> dict[str, list]:
         "Name": [],
     }
 
-def create_training_set(filepath: str, label: str, options: dict) -> pd.DataFrame:
+def create_training_set(filepath: str, label: str, options: optparse.Values) -> pd.DataFrame:
     path = Path(filepath)
     sample_path = path.parent / f"{path.stem}_samples"
     sample_path.mkdir(exist_ok=True)
@@ -1299,6 +1299,18 @@ def create_training_set(filepath: str, label: str, options: dict) -> pd.DataFram
 
     for k, v in feature_data.items():
         print(k, len(v))
+
+    # Filter out problematic values (inf or NaN) IFF set in options
+    if options.filter_invalid:
+        base_length = len(df)
+        df.dropna(inplace=True)
+        mask_non_finite = ~np.isfinite(df).all(axis=1)
+        df = df[~mask_non_finite]
+        nan_length = len(df)
+
+        # Inform user on dropped rows
+        if base_length > nan_length:
+            print(f"WARNING: Table contained inf or NaN values. {base_length - nan_length} rows were dropped.")
 
     return pd.DataFrame(data=feature_data)
 
@@ -1636,12 +1648,17 @@ def unpack_features(df: pd.DataFrame) -> tuple[np.typing.NDArray[np.float64], np
 
 def build_model(options: optparse.Values, filename: str) -> None:
     df = pd.read_csv(filename, sep="\t")
+
+    # Filter out problematic values (inf or NaN)
     base_length = len(df)
     df.dropna(inplace=True)
+    mask_non_finite = ~np.isfinite(df).all(axis=1)
+    df = df[~mask_non_finite]
     nan_length = len(df)
 
+    # Inform user on dropped rows
     if base_length > nan_length:
-        print(f"WARNING: Table contained NaN values. {base_length - nan_length} rows were dropped.")
+        print(f"WARNING: Table contained inf or NaN values. {base_length - nan_length} rows were dropped.")
 
     df["Label"] = [class_dict.get(a) for a in df["Class"]]
     x, y = unpack_features(df)
@@ -2175,6 +2192,7 @@ def data(parser):
     parser.add_option("-s", "--samples",action="store",type="int",dest="n_samples",default=10,help="The number of times samples should be drawn from each input alignment and number of sequences - for variation (Default: 10).")
     parser.add_option("-a", "--sample-attempts",action="store",type="int",dest="sampling_attempts",default=1000,help="The number of times sampling should be attempted on a given alignment. Mostly a question of computation time (Default: 1000)")
     # parser.add_option("-g", "--generate-control", action="store",default=True,dest="generate_control",help="Flag to determine if a negative set should be auto-generated (Default: True, if no 'other' data set is supplied).")
+    parser.add_option("-x", "--filter-invalid", action="store_true", default=False, dest="filter_invalid", help="Automatically drop invalid values (inf or nan) potentially resulting from faulty alignments (Default: False).")
     parser.add_option("-c", "--shuffle-control", action="store_true", default=False, dest="shuffle_control",help="Use a simpler column-based shuffling approach instead of SISSIz (Default: False).")
     # parser.add_option("-p", "--positive-label", action="store", default="ncRNA",dest="pos_label",help="The label that should be assigned to the feature vectors generated from the (non-control) input data. Can be CDS (for protein coding sequences) or ncRNA. (Default: ncRNA).")
     parser.add_option("-H", "--hexamer-model", action="store",dest="hexamer_model",default=os.path.join(os.path.join(THIS_DIR, "hexamer_models"), "Human_hexamer.tsv"),help="The Location of the statistical Hexamer model to use. An example file is included with the download as Human_hexamer.tsv, which will be used as a fallback.")
