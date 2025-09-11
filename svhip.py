@@ -1304,7 +1304,7 @@ def create_training_set(filepath: str, label: str, options: optparse.Values) -> 
     if options.filter_invalid:
         base_length = len(df)
         df.dropna(inplace=True)
-        mask_non_finite = ~np.isfinite(df).all(axis=1)
+        mask_non_finite = ~np.isfinite(df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]).all(axis=1)
         df = df[~mask_non_finite]
         nan_length = len(df)
 
@@ -1652,7 +1652,7 @@ def build_model(options: optparse.Values, filename: str) -> None:
     # Filter out problematic values (inf or NaN)
     base_length = len(df)
     df.dropna(inplace=True)
-    mask_non_finite = ~np.isfinite(df).all(axis=1)
+    mask_non_finite = ~np.isfinite(df[["SCI", "z-score of MFE", "Shannon-entropy", "Hexamer Score", "Codon conservation"]]).all(axis=1)
     df = df[~mask_non_finite]
     nan_length = len(df)
 
