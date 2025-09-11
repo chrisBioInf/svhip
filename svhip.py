@@ -1636,7 +1636,13 @@ def unpack_features(df: pd.DataFrame) -> tuple[np.typing.NDArray[np.float64], np
 
 def build_model(options: optparse.Values, filename: str) -> None:
     df = pd.read_csv(filename, sep="\t")
-    
+    base_length = len(df)
+    df.dropna(inplace=True)
+    nan_length = len(df)
+
+    if base_length > nan_length:
+        print(f"WARNING: Table contained NaN values. {base_length - nan_length} rows were dropped.")
+
     df["Label"] = [class_dict.get(a) for a in df["Class"]]
     x, y = unpack_features(df)
     
